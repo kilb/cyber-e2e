@@ -70,3 +70,18 @@ def test_not_ready_without_public_tests(tmp_path, toycase):
     rep = e2e_audit.audit_case(bad)
     assert not rep.ready
     assert any("public_tests" in r for r in rep.reasons), rep.reasons
+
+
+def test_case_fingerprint_stable_and_sensitive(tmp_path, toycase):
+    import shutil
+    fp1 = e2e_audit.case_fingerprint(toycase)
+    copy = tmp_path / "copy"
+    shutil.copytree(toycase, copy)
+    assert e2e_audit.case_fingerprint(copy) == fp1          # content-addressed, path-independent
+    (copy / "repo" / "prog.c").write_text("changed\n", encoding="utf-8")
+    assert e2e_audit.case_fingerprint(copy) != fp1          # sensitive to served content
+    # witness/fix changes do NOT affect the fingerprint (not served)
+    copy2 = tmp_path / "copy2"
+    shutil.copytree(toycase, copy2)
+    (copy2 / "fix.patch").write_text("irrelevant\n", encoding="utf-8")
+    assert e2e_audit.case_fingerprint(copy2) == fp1

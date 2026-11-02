@@ -21,6 +21,7 @@ CLI:  python3 e2e_audit.py <case_dir> [<case_dir> ...]   # non-zero if any bad
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import re
 import sys
 from pathlib import Path
@@ -68,6 +69,22 @@ def served_source_files(bundle: Path | str) -> list[Path]:
             continue
         out.append(path)
     return out
+
+
+def case_fingerprint(bundle: Path | str) -> str:
+    """A content hash of exactly what the agent is served (repo/ only), so a run
+    can be tied to the precise tree it used and tree-drift between runs is
+    detectable. Stable across machines (relative paths + bytes, sorted)."""
+    bundle = Path(bundle)
+    h = hashlib.sha256()
+    for path in served_source_files(bundle):
+        rel = path.relative_to(bundle).as_posix().encode()
+        h.update(len(rel).to_bytes(4, "big"))
+        h.update(rel)
+        data = path.read_bytes()
+        h.update(len(data).to_bytes(8, "big"))
+        h.update(data)
+    return h.hexdigest()
 
 
 def _declared_public_tests(bundle: Path) -> list:

@@ -79,3 +79,13 @@ def test_aggregate_by_model_macro():
     assert math.isclose(bm.macro_pass1, 0.75)
     assert bm.cases_attempted == 2
     assert bm.cases_solved_any == 2   # both have >=1 PASS
+
+
+def test_manifest_has_core_fields(tmp_path):
+    man = R.write_manifest(tmp_path / "run.manifest.json", extra={"config": {"trials": 3}})
+    assert man["schema"].startswith("cybergym-e2e.manifest")
+    assert "platform" in man and "python" in man and "ts" in man
+    assert man["config"]["trials"] == 3
+    import json
+    on_disk = json.loads((tmp_path / "run.manifest.json").read_text())
+    assert on_disk["python"] == man["python"]

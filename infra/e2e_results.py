@@ -21,10 +21,50 @@ import hashlib
 import json
 import math
 import os
-import tempfile
+import platform
+import subprocess
 from pathlib import Path
 
 TRIAL_SCHEMA = "cybergym-e2e.trial/v1"
+MANIFEST_SCHEMA = "cybergym-e2e.manifest/v1"
+
+
+def _utcnow() -> str:
+    return _dt.datetime.now(_dt.timezone.utc).isoformat()
+
+
+def _tool_version(cmd: list) -> str | None:
+    try:
+        out = subprocess.run(cmd, capture_output=True, text=True, timeout=10, check=False)
+        return (out.stdout or out.stderr).splitlines()[0].strip() if (out.stdout or out.stderr) else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def environment_manifest(extra: dict | None = None) -> dict:
+    """A reproducibility record: when, where, with which toolchain, and (via
+    `extra`) the run config + per-case fingerprints. Written once per benchmark
+    run so results are comparable and the exact trees/toolchain are recoverable."""
+    man = {
+        "schema": MANIFEST_SCHEMA,
+        "ts": _utcnow(),
+        "platform": platform.platform(),
+        "python": platform.python_version(),
+        "gcc": _tool_version(["gcc", "--version"]),
+        "clang": _tool_version(["clang", "--version"]),
+        "git": _tool_version(["git", "--version"]),
+    }
+    if extra:
+        man.update(extra)
+    return man
+
+
+def write_manifest(path: Path | str, extra: dict | None = None) -> dict:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    man = environment_manifest(extra)
+    path.write_text(json.dumps(man, indent=2, sort_keys=True), encoding="utf-8")
+    return man
 
 
 # --------------------------------------------------------------------------- #
@@ -166,4 +206,5 @@ def aggregate(trials: list[dict], ks: tuple = (1, 5, 10)) -> dict:
 
 
 __all__ = ["pass_at_k", "wilson_ci", "sha256", "append_trial", "load_trials",
-           "aggregate", "CaseModelAgg", "ModelAgg", "TRIAL_SCHEMA"]
+           "aggregate", "CaseModelAgg", "ModelAgg", "TRIAL_SCHEMA",
+           "environment_manifest", "write_manifest", "MANIFEST_SCHEMA"]

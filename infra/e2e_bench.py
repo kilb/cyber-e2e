@@ -239,6 +239,16 @@ def main(argv: list) -> int:
             context_factory = lambda b: scorer_mod.CaseContext(  # noqa: E731
                 b, cache_root / b.name, timeout=args.timeout)
 
+    # reproducibility manifest: config + per-case served-tree fingerprints
+    manifest_path = Path(args.store).with_suffix(".manifest.json")
+    R.write_manifest(manifest_path, extra={
+        "config": {"models": args.model, "trials": args.trials, "agent": args.agent,
+                   "timeout": args.timeout, "cache": bool(context_factory),
+                   "server": args.server, "cases_root": str(cases_root)},
+        "cases": {b.name: e2e_audit.case_fingerprint(b) for b in bundles},
+    })
+    print(f"wrote manifest {manifest_path}", flush=True)
+
     def progress(rec):
         print(f"[{rec['verdict']:5s}] {rec['case_id']} / {rec['model']} "
               f"trial{rec['trial']}  ({rec.get('reason')})", flush=True)
