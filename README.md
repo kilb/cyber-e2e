@@ -37,11 +37,32 @@ authoritative re-validation via the real scorer, and non-oracle infra scaffoldin
 ## Repo layout
 
 - `docs/` — handoff specs for the GLM worker: task contract, environment,
-  case inventory, known gotchas inherited from the sibling project.
-- `infra/` — reusable non-oracle infrastructure (sandbox wrapper, server
-  skeleton pattern). Harness/scorer code that encodes vulnerability-specific
-  logic belongs under `cases/<case-id>/`, authored by the GLM worker, not here.
-- `cases/` — one directory per e2e case once built (empty for now).
+  per-case authoring contract, case inventory, known gotchas.
+- `infra/` — the vulnerability-agnostic framework (Claude-authored plumbing):
+  - `server.py` — e2e submission API (lease a source-only case, accept a
+    `(poc, patch)` pair, enqueue a job, return the 4-row verdict).
+  - `repo_e2e_task.py` — the 4-row scoring orchestration: build the vulnerable
+    tree, git-apply the agent's patch and build it, invoke the per-case oracle
+    as an opaque subprocess for rows 1/2/4, run the project's own test suite for
+    row 3, AND the four booleans.
+  - `e2e_local.py` — local runner: lease a case, drive the agent CLI with a
+    no-hints prompt, collect `out/poc` + `out/fix.patch`, submit, record a
+    durable `summary.json`.
+  - `start_server.sh` — (re)start uvicorn on port 8900.
+  - `sandbox_wrapper.sh` — unprivileged bwrap sandbox (PID-isolated) for one
+    agent run.
+- `cases/` — one directory per e2e case once built (empty for now). Each case's
+  `witness/e2e_probe.py` (the oracle), `witness/model_poc_reference.*` (the
+  ground-truth PoC), real `build.yaml` recipe and real `public_tests` are
+  authored by the GLM worker per `docs/case-authoring.md` — NOT by Claude.
+
+### What is NOT here yet (intentionally — it's GLM's half)
+
+The framework is complete and compiles, but there are zero live cases: no
+`e2e_probe.py` oracle, no reference PoC, no real per-case build/test recipe has
+been written, because authoring those is the GLM worker's job. The next step is
+to stand this up on blk.so (`~/rrg-e2e`, port 8900) and hand the first pilot
+case to GLM to author against `docs/case-authoring.md`.
 
 ## Execution environment
 
