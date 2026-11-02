@@ -34,6 +34,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import e2e_audit  # noqa: E402
+import e2e_exec  # noqa: E402 -- host/docker execution backend
 import e2e_local  # noqa: E402 -- reused submit/poll for the http scoring context
 import e2e_report  # noqa: E402
 import e2e_results as R  # noqa: E402
@@ -48,12 +49,13 @@ _ROW_KEYS = R.ROW_KEYS  # canonical trial-record row shape
 class _FreshScorer:
     """Fresh-per-submission in-process scoring (full isolation, no shared state)."""
 
-    def __init__(self, bundle: Path, timeout: int):
-        self.bundle, self.timeout = bundle, timeout
+    def __init__(self, bundle: Path, timeout: int, backend=None):
+        self.bundle, self.timeout, self.backend = bundle, timeout, backend
 
     def score(self, poc, patch, work, *, timeout=None, mode="e2e"):
         return scorer_mod.score_repo_e2e(self.bundle, poc, patch, work,
-                                         timeout=timeout or self.timeout, mode=mode)
+                                         timeout=timeout or self.timeout, mode=mode,
+                                         backend=self.backend)
 
     def close(self):
         pass
@@ -79,13 +81,15 @@ class _HttpScorer:
         pass
 
 
-def fresh_context(timeout: int):
-    return lambda bundle: _FreshScorer(Path(bundle), timeout)
+def fresh_context(timeout: int, backend_factory=None):
+    return lambda bundle: _FreshScorer(
+        Path(bundle), timeout, backend_factory() if backend_factory else None)
 
 
-def cached_context(cache_root: Path, timeout: int):
-    return lambda bundle: scorer_mod.CaseContext(Path(bundle), cache_root / Path(bundle).name,
-                                                 timeout=timeout)
+def cached_context(cache_root: Path, timeout: int, backend_factory=None):
+    return lambda bundle: scorer_mod.CaseContext(
+        Path(bundle), cache_root / Path(bundle).name, timeout=timeout,
+        backend=backend_factory() if backend_factory else None)
 
 
 def http_context(server: str, key: str, poll_timeout: int):
@@ -272,6 +276,10 @@ def main(argv: list) -> int:
                          "and reuse across its trials (mutually exclusive with --server)")
     ap.add_argument("--mode", default="e2e", choices=list(scorer_mod.MODES),
                     help="e2e (find+PoC+patch) or patch-only (fix given the PoC)")
+    ap.add_argument("--backend", default="host", choices=["host", "docker"],
+                    help="in-process: run build/test/oracle on the host or in a container")
+    ap.add_argument("--base-image", default="ubuntu:24.04", help="docker backend base image")
+    ap.add_argument("--network", default="none", help="docker backend network (none|bridge|...)")
     ap.add_argument("--report-md", default=None)
     ap.add_argument("--report-html", default=None)
     ap.add_argument("--ks", default="1,5,10")
@@ -292,15 +300,21 @@ def main(argv: list) -> int:
     prompt = _PATCH_ONLY_PROMPT if args.mode == "patch-only" else _DEFAULT_PROMPT
     solver = cli_agent_solver(args.agent, prompt=prompt, budget=args.agent_budget,
                               sandbox=args.sandbox, mode=args.mode)
+    backend_factory = None
+    if args.backend == "docker":
+        backend_factory = lambda: e2e_exec.make_backend(  # noqa: E731
+            "docker", base_image=args.base_image, network=args.network)
     if args.server:
         score_context = http_context(args.server, args.api_key or "", args.timeout + 600)
         scoring_label = f"server:{args.server}"
+        if args.backend != "host":
+            print("note: --backend is ignored when scoring via --server (server picks its own)", file=sys.stderr)
     elif args.cache:
-        score_context = cached_context(Path(args.work_root) / ".cache", args.timeout)
-        scoring_label = "in-process (cached)"
+        score_context = cached_context(Path(args.work_root) / ".cache", args.timeout, backend_factory)
+        scoring_label = f"in-process cached ({args.backend})"
     else:
-        score_context = fresh_context(args.timeout)
-        scoring_label = "in-process (fresh)"
+        score_context = fresh_context(args.timeout, backend_factory)
+        scoring_label = f"in-process fresh ({args.backend})"
 
     # reproducibility manifest: config + per-case served-tree fingerprints
     manifest_path = Path(args.store).with_suffix(".manifest.json")

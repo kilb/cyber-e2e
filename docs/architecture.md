@@ -152,18 +152,41 @@ certified iff all pass:
   the JSON observation, so a noisy oracle that prints a diagnostic first is fine;
   non-JSON output is a hard error.
 
+## Execution backends (where build/test/oracle run)
+
+The scorer's three subprocess kinds — shell build, shell tests, and the oracle —
+run through a pluggable backend (`infra/e2e_exec.py`):
+
+- **HostBackend** (default) — directly on the host; inherits its toolchain/env.
+  Simple; fine for a trusted, controlled box.
+- **DockerBackend** ("plan B") — inside a container built from a base image +
+  the case's declared `system_packages` (installed once; the image is content-
+  addressed and cached, so the same package-set is built once across cases/jobs/
+  threads). Build AND oracle run in the SAME image, so a binary built there also
+  runs there (ABI match). Gives per-project toolchain isolation, reproducibility,
+  a containment boundary for untrusted patch/PoC code, and enforceable network
+  policy (`--network none` by default; builds still have network during the
+  one-time image build). Runs as the host uid (`--user`) so build artifacts are
+  not left root-owned. This makes `system_packages` load-bearing (host mode
+  treats it as a precondition).
+
+Select with `e2e_bench --backend host|docker [--base-image … --network …]`, or the
+server's `E2E_BACKEND` / `E2E_BASE_IMAGE` / `E2E_DOCKER_NETWORK` env. The host path
+is behavior-identical to before; the backend only changes *where* commands run.
+
 ## Trust model & isolation
 
 Leak prevention keeps the *answer* from the agent; it does not sandbox execution.
 Scoring **runs agent-influenced code**: it builds a target from (vulnerable
 source + the agent's patch) and the oracle runs that binary on the agent's PoC
 input. The harness isolates *between jobs* (fresh trees, per-job TMPDIR, and the
-agent run itself goes through `sandbox_wrapper.sh`), but it does **not** by itself
-contain a maliciously-crafted patch/PoC that executes code during build or run.
-For evaluating untrusted agents, run the scorer inside a container/VM at the
-deployment layer (the one strong isolation boundary this environment's bwrap —
-PID-only, shared FS/network — cannot provide). The trusted-orchestration use
-(Claude/GLM on blk.so) does not need this.
+agent run itself goes through `sandbox_wrapper.sh`), and with the **DockerBackend**
+(above) the build/test/oracle run inside a container with `--network none`, which
+is the containment boundary for a maliciously-crafted patch/PoC. The default
+HostBackend does **not** contain such code, so for untrusted agents use the Docker
+backend (or a VM at the deployment layer); this environment's bwrap is PID-only and
+cannot provide it. The trusted-orchestration use (Claude/GLM on blk.so) can use the
+host backend.
 
 ## Metrics methodology
 

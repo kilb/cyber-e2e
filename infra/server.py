@@ -42,9 +42,14 @@ if str(ROOT) not in sys.path:
 # harness and tests -- no importlib-by-path dance, no duplicate RepoE2EScore class.
 import repo_e2e_task as _task  # noqa: E402
 import e2e_audit  # noqa: E402 -- shares the served-payload selection + leak audit
+import e2e_exec  # noqa: E402 -- host/docker execution backend
 import e2e_results as _results  # noqa: E402 -- optional durable result store
 
 _ROW_KEYS = _results.ROW_KEYS
+# Execution backend for scoring: host (default) or docker, via $E2E_BACKEND
+# (+ $E2E_BASE_IMAGE / $E2E_DOCKER_NETWORK). A fresh instance per job keeps the
+# per-case image state isolated; the underlying image build is globally cached.
+BACKEND_KIND = os.environ.get("E2E_BACKEND", "host")
 
 
 def _discover_cases() -> tuple[str, ...]:
@@ -199,7 +204,9 @@ def _run_job(job_id: str, case_id: str, poc: bytes | None, patch: bytes, mode: s
     error = None
     try:
         bundle = CASES_ROOT / case_id
-        score = _task.score_repo_e2e(bundle, poc, patch, work, timeout=SCORE_TIMEOUT_SECONDS, mode=mode)
+        backend = e2e_exec.make_backend(BACKEND_KIND)  # fresh per job (per-case image state)
+        score = _task.score_repo_e2e(bundle, poc, patch, work, timeout=SCORE_TIMEOUT_SECONDS,
+                                     mode=mode, backend=backend)
         result = asdict(score) if is_dataclass(score) else score
         with _jobs_lock:
             _jobs[job_id]["status"] = "done"

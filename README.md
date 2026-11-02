@@ -48,11 +48,17 @@ See `docs/architecture.md` for the full component map and trust boundaries.
 - `infra/` — the vulnerability-agnostic framework:
   - **Scoring**
     - `repo_e2e_task.py` — the 4-row scorer. `score_repo_e2e` (fresh per
-      submission, full isolation) and `CaseContext` (builds the vulnerable tree +
-      row-3 baseline once, reused across a case's trials) share one `_score_core`.
-      Invokes the per-case oracle as an opaque subprocess.
-    - `server.py` — submission API: serves `repo/` ONLY, discovery gated on the
-      leak audit, async job queue.
+      submission) and `CaseContext` (builds the vulnerable tree + row-3 baseline
+      once, reused across a case's trials) share one `_score_core`. Supports
+      `mode="e2e"` (PoC+patch) and `mode="patch-only"` (fix given the PoC; rows
+      1-2 skipped). Build/test/oracle run through a pluggable backend.
+    - `e2e_exec.py` — execution backends: `HostBackend` (default) and
+      `DockerBackend` ("plan B": base image + declared `system_packages`, image
+      content-cached) for reproducible, isolated, network-policied scoring.
+    - `server.py` — submission API: serves `repo/` ONLY (plus the reference PoC in
+      patch-only), discovery gated on the leak audit, async job queue; `mode` per
+      submission; optional durable result store (`E2E_RESULTS`); backend via
+      `E2E_BACKEND`.
   - **Harness (SOTA layer)**
     - `e2e_audit.py` — leakage + readiness audit (withheld check derived from the
       bundle's own `witness/`, incl. byte-identical-copy detection); the single
