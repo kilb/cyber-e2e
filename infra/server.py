@@ -13,9 +13,7 @@ e2e task. Submitted (poc, patch) bytes are passed unchanged into
 """
 from __future__ import annotations
 
-import importlib.util
 import io
-import json
 import os
 import secrets
 import shutil
@@ -40,24 +38,26 @@ WORK_ROOT.mkdir(parents=True, exist_ok=True)
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-_spec = importlib.util.spec_from_file_location("e2e_repo_task", ROOT / "repo_e2e_task.py")
-_task = importlib.util.module_from_spec(_spec)
-sys.modules[_spec.name] = _task
-_spec.loader.exec_module(_task)
-
+# Plain imports (ROOT is on sys.path): one module instance each, shared with the
+# harness and tests -- no importlib-by-path dance, no duplicate RepoE2EScore class.
+import repo_e2e_task as _task  # noqa: E402
 import e2e_audit  # noqa: E402 -- shares the served-payload selection + leak audit
 
 
 def _discover_cases() -> tuple[str, ...]:
     """Advertise only FULLY-CONVERTED, LEAK-FREE e2e cases. A subdir of
-    CASES_ROOT is listed only when `e2e_audit.audit_case(...).ok` holds, i.e. it
-    is both e2e-ready (repo/ + witness/e2e_probe.py + a row-4 reference PoC + a
-    non-empty row-3 test suite) AND leak-free (nothing in the served repo/ tree
-    fingerprints the vulnerability or ships an answer artifact). Raw PoC-gen
-    material (only probe.py, no public_tests) and any case that would leak its
-    answer to the agent are deliberately skipped. Discovered fresh at import
-    time; restart the server after a case becomes ready (same restart-to-register
-    discipline as the sibling project)."""
+    CASES_ROOT is listed only when it passes the CHEAP structural gate
+    `e2e_audit.audit_case(..., scan_content=False).ok`: e2e-ready (repo/ +
+    witness/e2e_probe.py + a row-4 reference PoC + a non-empty row-3 test suite)
+    AND free of structural leaks (no served file named like / pathed under a
+    withheld artifact). This gate does NOT read file contents, so it does not by
+    itself prove the stronger content-level leak-freedom (no byte-identical
+    renamed copies, no fingerprinting CVE/commit in content). That full audit is a
+    required pre-flight step (`e2e_audit.py` / `e2e_certify.py`) before a case goes
+    live -- kept out of startup because reading every file of every large repo on
+    each restart would be slow. Discovered fresh at import time; restart the server
+    after a case becomes ready (same restart-to-register discipline as the sibling
+    project)."""
     if not CASES_ROOT.is_dir():
         return ()
     found = []

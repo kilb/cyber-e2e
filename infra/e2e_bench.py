@@ -5,25 +5,28 @@ durable JSONL store the moment it is scored, then (optionally) renders the
 leaderboard. This is the layer that produces benchmark numbers (pass@k) rather
 than a single verdict.
 
-The run loop is decoupled from HOW a trial is produced and scored:
+The run loop is decoupled from HOW a trial is produced and scored, through two
+injectable seams:
 
   * solver(bundle, model, work_dir) -> (poc_bytes, patch_bytes, meta)
         Default `cli_agent_solver` drives an agent CLI exactly like e2e_local;
         tests inject a fake solver.
-  * scorer(bundle, poc, patch, work_dir, timeout) -> RepoE2EScore-like
-        Default scores in-process via repo_e2e_task; `http_submit_scorer` routes
-        through a running server instead.
+  * score_context(bundle) -> a per-case scoring context with
+        .score(poc, patch, work, *, timeout=None) -> RepoE2EScore  and  .close()
+        One seam for all three scoring modes: fresh in-process (default), cached
+        in-process (CaseContext, `--cache`), or via a running server (`--server`).
 
-A solver/scorer exception becomes an ERROR trial (recorded, excluded from pass
-rates), never a crash of the whole run.
+A solver/score exception, or a context-build failure, becomes an ERROR trial
+(recorded, excluded from pass rates), never a crash of the whole run.
 
 CLI: python3 e2e_bench.py --cases-root DIR --model M [--case C ...]
          --trials N [--store FILE] [--report-html FILE] [--report-md FILE]
-         [--server URL]   # route scoring through a server instead of in-process
+         [--cache | --server URL]
 """
 from __future__ import annotations
 
 import argparse
+import shutil
 import sys
 import time
 import traceback
@@ -31,6 +34,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import e2e_audit  # noqa: E402
+import e2e_local  # noqa: E402 -- reused submit/poll for the http scoring context
 import e2e_report  # noqa: E402
 import e2e_results as R  # noqa: E402
 import repo_e2e_task as scorer_mod  # noqa: E402
@@ -42,18 +46,66 @@ _ROW_KEYS = (
 )
 
 
-def inprocess_scorer(bundle: Path, poc: bytes, patch: bytes, work: Path, timeout: int):
-    return scorer_mod.score_repo_e2e(bundle, poc, patch, work, timeout=timeout)
+# --------------------------------------------------------------------------- #
+# scoring contexts (one seam; fresh / cached / http)
+# --------------------------------------------------------------------------- #
+class _FreshScorer:
+    """Fresh-per-submission in-process scoring (full isolation, no shared state)."""
+
+    def __init__(self, bundle: Path, timeout: int):
+        self.bundle, self.timeout = bundle, timeout
+
+    def score(self, poc, patch, work, *, timeout=None):
+        return scorer_mod.score_repo_e2e(self.bundle, poc, patch, work,
+                                         timeout=timeout or self.timeout)
+
+    def close(self):
+        pass
 
 
-def _make_record(case_id, model, trial, *, accepted, reason, detail, meta,
-                 poc, patch, verdict, error=None, score_s=None):
+class _HttpScorer:
+    """Score by submitting to a running e2e server and polling the job."""
+
+    def __init__(self, server: str, key: str, bundle: Path, poll_timeout: int):
+        self.server, self.key = server.rstrip("/"), key
+        self.case_id, self.poll_timeout = bundle.name, poll_timeout
+
+    def score(self, poc, patch, work, *, timeout=None):
+        job_id = e2e_local._submit(self.server, self.key, self.case_id, poc, patch)
+        row = e2e_local._poll(self.server, self.key, job_id, timeout=self.poll_timeout)
+        if row.get("status") != "done":
+            raise RuntimeError(f"server scoring {row.get('status')}: {row.get('error')}")
+        res = row.get("result") or {}
+        return scorer_mod.RepoE2EScore(bool(res.get("accepted")), res.get("reason"),
+                                       res.get("detail") or {})
+
+    def close(self):
+        pass
+
+
+def fresh_context(timeout: int):
+    return lambda bundle: _FreshScorer(Path(bundle), timeout)
+
+
+def cached_context(cache_root: Path, timeout: int):
+    return lambda bundle: scorer_mod.CaseContext(Path(bundle), cache_root / Path(bundle).name,
+                                                 timeout=timeout)
+
+
+def http_context(server: str, key: str, poll_timeout: int):
+    return lambda bundle: _HttpScorer(server, key, Path(bundle), poll_timeout)
+
+
+def _make_record(case_id, model, trial, *, verdict, accepted, reason,
+                 detail=None, meta=None, poc=None, patch=None, error=None, score_s=None):
+    meta = meta or {}
+    detail = detail or {}
     return {
         "case_id": case_id, "model": model, "trial": trial,
         "verdict": verdict, "accepted": accepted, "reason": reason,
         "rows": {k: detail.get(k) for k in _ROW_KEYS} if detail else {},
-        "solve_s": (meta or {}).get("solve_s"),
-        "agent_rc": (meta or {}).get("agent_rc"),
+        "solve_s": meta.get("solve_s"),
+        "agent_rc": meta.get("agent_rc"),
         "score_s": score_s,
         "poc_bytes": len(poc) if poc is not None else None,
         "patch_bytes": len(patch) if patch is not None else None,
@@ -64,29 +116,27 @@ def _make_record(case_id, model, trial, *, accepted, reason, detail, meta,
 
 
 def run_benchmark(*, bundles, models, n_trials, solver, store, work_root,
-                  scorer=inprocess_scorer, context_factory=None,
-                  timeout=1800, on_trial=None) -> list[dict]:
+                  score_context=None, timeout=1800, on_trial=None) -> list[dict]:
     """Run n_trials of each (case, model), persisting each trial as it completes.
 
-    If `context_factory(bundle) -> CaseContext` is given, the case's vulnerable
-    tree + row-3 baseline are built ONCE and reused across that case's trials
-    (big speedup for real builds); a context-build failure turns every trial of
-    that case into an ERROR trial rather than crashing the run. Otherwise each
-    trial is scored independently via `scorer`.
+    `score_context(bundle)` returns a per-case scoring context (see module doc);
+    the default is fresh in-process scoring. The context is built once per case
+    and closed when the case's trials finish; a context-build failure turns every
+    trial of that case into an ERROR trial rather than crashing the run.
     """
     store = Path(store)
     work_root = Path(work_root)
+    score_context = score_context or fresh_context(timeout)
     records = []
     for bundle in bundles:
         bundle = Path(bundle)
         case_id = bundle.name
         ctx = None
         ctx_err = None
-        if context_factory is not None:
-            try:
-                ctx = context_factory(bundle)
-            except Exception as exc:  # noqa: BLE001 -- broken case: every trial is ERROR
-                ctx_err = f"{type(exc).__name__}: {exc}"
+        try:
+            ctx = score_context(bundle)
+        except Exception as exc:  # noqa: BLE001 -- broken case: every trial is ERROR
+            ctx_err = f"{type(exc).__name__}: {exc}"
         try:
             for model in models:
                 for trial in range(n_trials):
@@ -98,21 +148,17 @@ def run_benchmark(*, bundles, models, n_trials, solver, store, work_root,
                             raise RuntimeError(f"case context build failed: {ctx_err}")
                         poc, patch, meta = solver(bundle, model, work)
                         t0 = time.time()
-                        if ctx is not None:
-                            res = ctx.score(poc, patch, work / "score", timeout=timeout)
-                        else:
-                            res = scorer(bundle, poc, patch, work / "score", timeout)
+                        res = ctx.score(poc, patch, work / "score", timeout=timeout)
                         score_s = round(time.time() - t0, 2)
                         rec = _make_record(
                             case_id, model, trial,
+                            verdict="PASS" if res.accepted else "FAIL",
                             accepted=res.accepted, reason=res.reason, detail=res.detail,
-                            meta=meta, poc=poc, patch=patch, score_s=score_s,
-                            verdict="PASS" if res.accepted else "FAIL")
+                            meta=meta, poc=poc, patch=patch, score_s=score_s)
                     except Exception as exc:  # noqa: BLE001
                         rec = _make_record(
-                            case_id, model, trial,
-                            accepted=None, reason="error", detail={}, meta=None,
-                            poc=poc, patch=patch, verdict="ERROR",
+                            case_id, model, trial, verdict="ERROR",
+                            accepted=None, reason="error", poc=poc, patch=patch,
                             error=f"{type(exc).__name__}: {exc}\n{traceback.format_exc()[-800:]}")
                     stored = R.append_trial(store, rec)
                     records.append(stored)
@@ -125,20 +171,22 @@ def run_benchmark(*, bundles, models, n_trials, solver, store, work_root,
 
 
 # --------------------------------------------------------------------------- #
-# production wiring (not unit-tested against real services)
+# default solver (drives an agent CLI; not unit-tested against a real agent)
 # --------------------------------------------------------------------------- #
 def cli_agent_solver(agent: str, *, prompt: str, budget: int, sandbox: str | None = None):
-    """Build a solver that extracts repo/ into the work dir, runs an agent CLI
-    with cwd=work, and reads back out/poc + out/fix.patch. Mirrors e2e_local."""
-    import os
-    import shutil
+    """Build a solver that materializes the SERVED repo/ (exactly what the server
+    would ship -- no .git/.rrg-build) into the work dir, runs an agent CLI with
+    cwd=work, and reads back out/poc + out/fix.patch. Mirrors e2e_local but keeps
+    bench and server trees in parity (same fingerprinted payload)."""
     import subprocess
 
     def solver(bundle: Path, model: str, work: Path):
-        repo_src = bundle / "repo"
         repo_dst = work / "repo"
         if not repo_dst.exists():
-            shutil.copytree(repo_src, repo_dst)
+            for src in e2e_audit.served_source_files(bundle):
+                dst = work / src.relative_to(bundle)   # bundle/repo/x -> work/repo/x
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(src, dst)
         out = work / "out"
         out.mkdir(parents=True, exist_ok=True)
         (work / "TASK.md").write_text(prompt, encoding="utf-8")
@@ -157,29 +205,6 @@ def cli_agent_solver(agent: str, *, prompt: str, budget: int, sandbox: str | Non
         return poc_p.read_bytes(), patch_p.read_bytes(), {"solve_s": solve_s, "agent_rc": proc.returncode}
 
     return solver
-
-
-def http_submit_scorer(server: str, key: str, *, poll_timeout: int = 2400):
-    """Score by submitting to a running e2e server and polling the job."""
-    import importlib.util
-    spec = importlib.util.spec_from_file_location("e2e_local", Path(__file__).resolve().parent / "e2e_local.py")
-    local = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(local)
-
-    class _Res:
-        def __init__(self, result):
-            self.accepted = bool(result.get("accepted"))
-            self.reason = result.get("reason")
-            self.detail = result.get("detail") or {}
-
-    def scorer(bundle: Path, poc: bytes, patch: bytes, work: Path, timeout: int):
-        job_id = local._submit(server.rstrip("/"), key, bundle.name, poc, patch)
-        row = local._poll(server.rstrip("/"), key, job_id, timeout=poll_timeout)
-        if row.get("status") != "done":
-            raise RuntimeError(f"server scoring {row.get('status')}: {row.get('error')}")
-        return _Res(row.get("result") or {})
-
-    return scorer
 
 
 _DEFAULT_PROMPT = (
@@ -207,12 +232,14 @@ def main(argv: list) -> int:
     ap.add_argument("--server", default=None, help="score via this server URL instead of in-process")
     ap.add_argument("--api-key", default=None)
     ap.add_argument("--cache", action="store_true",
-                    help="in-process only: build each case's vulnerable tree + row-3 baseline "
-                         "once and reuse across its trials (CaseContext)")
+                    help="in-process: build each case's vulnerable tree + row-3 baseline once "
+                         "and reuse across its trials (mutually exclusive with --server)")
     ap.add_argument("--report-md", default=None)
     ap.add_argument("--report-html", default=None)
     ap.add_argument("--ks", default="1,5,10")
     args = ap.parse_args(argv[1:])
+    if args.server and args.cache:
+        ap.error("--cache and --server are mutually exclusive (server scoring has no local build to cache)")
 
     cases_root = Path(args.cases_root)
     if args.case:
@@ -226,28 +253,24 @@ def main(argv: list) -> int:
 
     solver = cli_agent_solver(args.agent, prompt=_DEFAULT_PROMPT,
                               budget=args.agent_budget, sandbox=args.sandbox)
-    context_factory = None
     if args.server:
-        key = args.api_key or ""
-        scorer = http_submit_scorer(args.server, key, poll_timeout=args.timeout + 600)
-        if args.cache:
-            print("note: --cache is ignored when scoring via --server", file=sys.stderr)
+        score_context = http_context(args.server, args.api_key or "", args.timeout + 600)
+        mode = f"server:{args.server}"
+    elif args.cache:
+        score_context = cached_context(Path(args.work_root) / ".cache", args.timeout)
+        mode = "in-process (cached)"
     else:
-        scorer = inprocess_scorer
-        if args.cache:
-            cache_root = Path(args.work_root) / ".cache"
-            context_factory = lambda b: scorer_mod.CaseContext(  # noqa: E731
-                b, cache_root / b.name, timeout=args.timeout)
+        score_context = fresh_context(args.timeout)
+        mode = "in-process (fresh)"
 
     # reproducibility manifest: config + per-case served-tree fingerprints
     manifest_path = Path(args.store).with_suffix(".manifest.json")
     R.write_manifest(manifest_path, extra={
         "config": {"models": args.model, "trials": args.trials, "agent": args.agent,
-                   "timeout": args.timeout, "cache": bool(context_factory),
-                   "server": args.server, "cases_root": str(cases_root)},
+                   "timeout": args.timeout, "scoring": mode, "cases_root": str(cases_root)},
         "cases": {b.name: e2e_audit.case_fingerprint(b) for b in bundles},
     })
-    print(f"wrote manifest {manifest_path}", flush=True)
+    print(f"wrote manifest {manifest_path} (scoring: {mode})", flush=True)
 
     def progress(rec):
         print(f"[{rec['verdict']:5s}] {rec['case_id']} / {rec['model']} "
@@ -255,14 +278,14 @@ def main(argv: list) -> int:
 
     run_benchmark(bundles=bundles, models=args.model, n_trials=args.trials,
                   solver=solver, store=args.store, work_root=args.work_root,
-                  scorer=scorer, context_factory=context_factory,
-                  timeout=args.timeout, on_trial=progress)
+                  score_context=score_context, timeout=args.timeout, on_trial=progress)
 
     ks = tuple(int(x) for x in args.ks.split(",") if x.strip())
     agg = R.aggregate(R.load_trials(args.store), ks=ks)
-    print("\n" + e2e_report.render_markdown(agg))
+    markdown = e2e_report.render_markdown(agg)
+    print("\n" + markdown)
     if args.report_md:
-        Path(args.report_md).write_text(e2e_report.render_markdown(agg), encoding="utf-8")
+        Path(args.report_md).write_text(markdown, encoding="utf-8")
     if args.report_html:
         Path(args.report_html).write_text(e2e_report.render_html(agg), encoding="utf-8")
     return 0

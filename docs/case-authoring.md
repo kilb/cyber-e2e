@@ -48,6 +48,24 @@ breaks functionality is correctly rejected. A stub that always passes defeats
 the whole point of the e2e contract. If a case cannot carry a real test suite,
 it is not e2e-ready and the scorer will reject every submission at row 3.
 
+### Optional: declare the vulnerability identifiers (recommended)
+
+Add a server-side `vulnerability:` block so the leak audit treats these exact
+values as secrets regardless of where they appear in `repo/` (otherwise the audit
+falls back to scraping CVE ids from non-served files and fix-commit hashes from
+`NOTES.md` only):
+
+```yaml
+vulnerability:
+  cve: CVE-2026-12345        # or a list; omit if none assigned
+  fix_commit: 3c832b523ee1…  # the upstream fix commit (full hash preferred)
+```
+
+This is never served to the agent (build.yaml is withheld); it only sharpens the
+leak check. `e2e_audit` also flags any served file that is a byte-identical copy
+of a withheld artifact (oracle / reference PoC / fix.patch / NOTES.md), so a
+renamed copy cannot slip through.
+
 ## witness/e2e_probe.py  (THE ORACLE -- GLM authors this)
 
 A standalone, importless-safe script run by the framework as:

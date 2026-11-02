@@ -54,14 +54,16 @@ See `docs/architecture.md` for the full component map and trust boundaries.
     - `server.py` — submission API: serves `repo/` ONLY, discovery gated on the
       leak audit, async job queue.
   - **Harness (SOTA layer)**
-    - `e2e_audit.py` — leakage + readiness audit; the single `served_source_files`
-      definition the server reuses; `case_fingerprint`.
+    - `e2e_audit.py` — leakage + readiness audit (withheld check derived from the
+      bundle's own `witness/`, incl. byte-identical-copy detection); the single
+      `served_source_files` definition the server reuses; `case_fingerprint`.
     - `e2e_certify.py` — accepted / no-op / narrow controls via the real scorer.
     - `e2e_results.py` — durable JSONL trial store; pass@1 (Wilson CI) + pass@k
       (unbiased estimator); aggregation; run manifest.
     - `e2e_report.py` — markdown + self-contained HTML leaderboard.
-    - `e2e_bench.py` — N-trials-per-(case,model) runner; pluggable solver/scorer;
-      `--cache`; writes a reproducibility manifest + leaderboard.
+    - `e2e_bench.py` — N-trials-per-(case,model) runner; injectable solver +
+      per-case scoring context (fresh / `--cache` / `--server`); writes a
+      reproducibility manifest + leaderboard.
     - `e2e_local.py` — single-run convenience runner.
   - **Ops** — `start_server.sh` (uvicorn on 8900), `sandbox_wrapper.sh`
     (unprivileged PID-isolated bwrap).

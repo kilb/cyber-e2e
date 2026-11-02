@@ -63,8 +63,8 @@ class CertifyReport:
 
 
 def _reference_poc_bytes(bundle: Path) -> bytes | None:
-    refs = sorted((bundle / "witness").glob("model_poc_reference.*"))
-    return refs[0].read_bytes() if refs else None
+    ref = scorer.reference_poc_path(bundle)  # single definition of the naming convention
+    return ref.read_bytes() if ref else None
 
 
 def _narrow_controls(bundle: Path) -> tuple[bytes, bytes] | None:

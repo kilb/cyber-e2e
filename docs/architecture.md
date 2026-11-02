@@ -82,26 +82,37 @@ aggregate(load_trials(store)) ─▶ pass@1/pass@k per (case,model) & per model
 render_markdown / render_html ─▶ leaderboard
 ```
 
-The solver and scorer are injectable (`e2e_bench.run_benchmark`): the default
-solver runs an agent CLI exactly like `e2e_local`; the default scorer runs
-in-process; `http_submit_scorer` routes scoring through a running `server.py`.
-Tests inject fake solvers to exercise the whole stack on the toy case in seconds.
+Two seams are injectable in `e2e_bench.run_benchmark`: the **solver**
+`(bundle, model, work) -> (poc, patch, meta)` (default drives an agent CLI like
+`e2e_local`, materializing the *served* repo/ so bench and server see the same
+fingerprinted tree), and the **score_context** `(bundle) -> ctx` with
+`ctx.score(...)` + `ctx.close()` — one seam for all three scoring modes: fresh
+in-process (default), cached in-process (`CaseContext`, `--cache`), or via a
+running server (`--server`). Tests inject fake solvers to exercise the whole
+stack on the toy case in seconds.
 
 ## Trust boundaries & leak prevention
 
 The entire contract depends on the agent seeing **only vulnerable source**.
 `e2e_audit.served_source_files` is the single definition of "what gets served"
 (repo/ minus `.git`/`.rrg-build`), imported by `server.py` so the audit validates
-the *real* serving path. `audit_case` fails a case (and the server refuses to
-advertise it) when:
+the *real* serving path. The withheld-artifact check is **derived from the
+bundle's own `witness/` + fix.patch + NOTES.md**, not a hand-maintained denylist,
+so it auto-adapts to the authoring contract. `audit_case` fails a case (and the
+server refuses to advertise it) when:
 
-- an **answer artifact** is inside `repo/` (`e2e_probe`, `model_poc`, `narrow_*`,
-  `fix.patch`, `NOTES.md`, anything under `witness/`), or
-- served content contains a **case-declared secret** (a CVE id / fix-commit hash
-  from `NOTES.md`).
+- a served file's **name matches a real witness/ artifact**, or its path includes
+  a withheld directory (`witness/`, `.git`) — the cheap structural gate; or
+- a served file is a **byte-identical copy** of any withheld artifact under any
+  name (content hash — catches a renamed oracle/reference the name check misses); or
+- served content contains a **case secret** — values declared in build.yaml
+  `vulnerability: {cve, fix_commit}` (exact, any location), else a CVE id from any
+  non-served file / a fix-commit hash from `NOTES.md` as a regex fallback.
 
-Stray historical CVE ids (e.g. an upstream changelog) are **warnings**, not
-failures, to avoid false positives on legitimate source.
+The byte-identical and secret checks read files, so they run in the full
+(`scan_content=True`) pre-flight audit used by the CLI and certification; server
+discovery runs only the cheap structural gate. Stray historical CVE ids (e.g. an
+upstream changelog) are **warnings**, not failures, to avoid false positives.
 
 ## Certification (trust the case before trusting a result)
 

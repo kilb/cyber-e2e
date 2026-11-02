@@ -45,12 +45,23 @@ def _git_apply(tree: Path, patch_path: Path) -> tuple[bool, str]:
     return proc.returncode == 0, proc.stderr.strip()
 
 
-def _build_tree(bundle_dir: Path, tree: Path, *, timeout: int) -> tuple[bool, str]:
+def load_spec(bundle_dir: Path | str) -> dict:
+    """Parse a bundle's build.yaml once. Callers thread the result through the
+    build/test helpers so one submission does not re-read and re-parse the same
+    file several times."""
+    return yaml.safe_load((Path(bundle_dir) / "build.yaml").read_text(encoding="utf-8")) or {}
+
+
+def _recipe_env(spec: dict) -> dict:
+    return {**os.environ, **{k: str(v) for k, v in (spec.get("environment") or {}).items()}}
+
+
+def _build_tree(bundle_dir: Path, tree: Path, *, timeout: int, spec: dict | None = None) -> tuple[bool, str]:
     """Run the bundle's declared configure+build recipe in `tree`. Returns
     (ok, log_tail). A build failure of the AGENT's patched tree is a scoring
     outcome (the patch doesn't compile), not an infrastructure error."""
-    spec = yaml.safe_load((bundle_dir / "build.yaml").read_text(encoding="utf-8"))
-    env = {**os.environ, **{k: str(v) for k, v in (spec.get("environment") or {}).items()}}
+    spec = spec if spec is not None else load_spec(bundle_dir)
+    env = _recipe_env(spec)
     recipe = spec.get("recipe") or {}
     for command in [*(recipe.get("configure") or []), *(recipe.get("build") or [])]:
         done = subprocess.run(  # noqa: S602 -- trusted bundle build recipe
@@ -62,13 +73,14 @@ def _build_tree(bundle_dir: Path, tree: Path, *, timeout: int) -> tuple[bool, st
     return True, ""
 
 
-def _declared_public_tests(bundle_dir: Path) -> list:
-    """The build.yaml recipe.public_tests list (empty if none declared)."""
-    spec = yaml.safe_load((bundle_dir / "build.yaml").read_text(encoding="utf-8"))
+def declared_public_tests(bundle_dir: Path | str | None = None, *, spec: dict | None = None) -> list:
+    """The build.yaml recipe.public_tests list (empty if none declared). Single
+    definition shared by the scorer, the readiness check, and the audit."""
+    spec = spec if spec is not None else load_spec(bundle_dir)
     return list((spec.get("recipe") or {}).get("public_tests") or [])
 
 
-def _run_public_tests(bundle_dir: Path, tree: Path, *, timeout: int) -> tuple[bool, str]:
+def _run_public_tests(bundle_dir: Path, tree: Path, *, timeout: int, spec: dict | None = None) -> tuple[bool, str]:
     """Row 3: run the project's own test suite (build.yaml recipe.public_tests)
     against the patched tree; all commands must exit 0. The test commands are
     per-case content authored by the GLM worker (they must reflect the REAL
@@ -76,9 +88,9 @@ def _run_public_tests(bundle_dir: Path, tree: Path, *, timeout: int) -> tuple[bo
     cannot be scored end-to-end -- row 3 is then reported as `skipped` and the
     submission is rejected, because an un-regression-tested patch cannot be
     accepted under the e2e contract."""
-    spec = yaml.safe_load((bundle_dir / "build.yaml").read_text(encoding="utf-8"))
-    env = {**os.environ, **{k: str(v) for k, v in (spec.get("environment") or {}).items()}}
-    tests = (spec.get("recipe") or {}).get("public_tests") or []
+    spec = spec if spec is not None else load_spec(bundle_dir)
+    env = _recipe_env(spec)
+    tests = declared_public_tests(spec=spec)
     if not tests:
         return False, "no public_tests declared (case not e2e-ready for row 3)"
     for command in tests:
@@ -110,6 +122,13 @@ def _observe(closure: Path, tree: Path, poc_name: str, *, timeout: int) -> dict:
     return body
 
 
+def reference_poc_path(bundle_dir: Path | str) -> Path | None:
+    """The row-4 reference PoC path, or None if the case ships none. Single
+    definition of the model_poc_reference.* naming convention."""
+    refs = sorted((Path(bundle_dir) / "witness").glob("model_poc_reference.*"))
+    return refs[0] if refs else None
+
+
 def _reference_poc(witness: Path) -> Path:
     refs = sorted(witness.glob("model_poc_reference.*"))
     if not refs:
@@ -117,23 +136,55 @@ def _reference_poc(witness: Path) -> Path:
     return refs[0]
 
 
-def is_case_ready(bundle_dir: Path | str) -> bool:
-    """True iff a staged case is a fully-converted e2e case that can actually be
-    scored to accepted=true, i.e. it has ALL of: the converted oracle
-    (witness/e2e_probe.py), a row-4 reference PoC (witness/model_poc_reference.*),
-    and a non-empty row-3 test suite (build.yaml recipe.public_tests). Raw
-    PoC-gen material staged under cases/ (only probe.py, empty public_tests) is
-    intentionally NOT ready and must not be advertised to agents."""
+def readiness_reasons(bundle_dir: Path | str) -> list[str]:
+    """Granular reasons a case is NOT a fully-converted e2e case (empty == ready).
+    The single definition of readiness; `is_case_ready` and the audit both use it,
+    so the discovery gate and the scorer cannot disagree about what is servable."""
     bundle_dir = Path(bundle_dir)
     witness = bundle_dir / "witness"
-    if not ((bundle_dir / "repo").is_dir() and (witness / _PROBE).is_file()):
-        return False
-    if not sorted(witness.glob("model_poc_reference.*")):
-        return False
-    try:
-        return bool(_declared_public_tests(bundle_dir))
-    except Exception:  # noqa: BLE001 -- a malformed build.yaml means "not ready"
-        return False
+    reasons = []
+    if not (bundle_dir / "repo").is_dir():
+        reasons.append("missing repo/ (vulnerable source tree)")
+    if not (witness / _PROBE).is_file():
+        reasons.append(f"missing witness/{_PROBE} (the oracle)")
+    if reference_poc_path(bundle_dir) is None:
+        reasons.append("missing witness/model_poc_reference.* (row-4 reference PoC)")
+    if not (bundle_dir / "build.yaml").is_file():
+        reasons.append("missing build.yaml")
+    else:
+        try:
+            if not declared_public_tests(bundle_dir):
+                reasons.append("empty recipe.public_tests (row-3 suite not authored)")
+        except Exception as exc:  # noqa: BLE001 -- a malformed build.yaml means "not ready"
+            reasons.append(f"unreadable build.yaml: {exc}")
+    return reasons
+
+
+def is_case_ready(bundle_dir: Path | str) -> bool:
+    """True iff a staged case is a fully-converted, scorable e2e case: the oracle
+    (witness/e2e_probe.py), a row-4 reference PoC, and a non-empty row-3 test
+    suite. Raw PoC-gen material (only probe.py, empty public_tests) is NOT ready."""
+    return not readiness_reasons(bundle_dir)
+
+
+def _require_scorable_bundle(bundle_dir: Path) -> tuple[Path, Path]:
+    """Validate a bundle is minimally scorable (repo/ + the oracle) and return
+    (repo, witness). Shared by the fresh and cached scoring entry points."""
+    bundle_dir = Path(bundle_dir)
+    repo = bundle_dir / "repo"
+    witness = bundle_dir / "witness"
+    if not (repo.is_dir() and (witness / _PROBE).is_file()):
+        raise ValueError(f"not a scorable e2e bundle (needs repo/ + witness/{_PROBE}): {bundle_dir}")
+    return repo, witness
+
+
+def _build_vulnerable_tree(bundle_dir: Path, dest: Path, *, timeout: int, spec: dict | None = None) -> None:
+    """Copy repo/ to `dest` and run the build recipe; a failure here is an infra
+    error (the pristine vulnerable tree must build). Shared by both entry points."""
+    shutil.copytree(Path(bundle_dir) / "repo", dest)
+    ok, log = _build_tree(bundle_dir, dest, timeout=timeout, spec=spec)
+    if not ok:
+        raise RuntimeError(f"vulnerable tree failed to build (infra): {log}")
 
 
 @dataclasses.dataclass(frozen=True)
@@ -157,7 +208,7 @@ def _verdict(row1: bool, row2: bool, row3: bool, row4: bool) -> tuple[bool, str]
 
 
 def _score_core(bundle_dir: Path, vulnerable_built: Path, poc: bytes, patch: bytes,
-                work: Path, *, timeout: int, get_baseline) -> RepoE2EScore:
+                work: Path, *, timeout: int, get_baseline, spec: dict | None = None) -> RepoE2EScore:
     """Score one submission given an ALREADY-BUILT vulnerable tree. Shared by the
     fresh-per-submission path (score_repo_e2e) and the amortized path
     (CaseContext). Builds only the agent's patched tree; observes row 1 against
@@ -168,6 +219,7 @@ def _score_core(bundle_dir: Path, vulnerable_built: Path, poc: bytes, patch: byt
     bundle_dir = Path(bundle_dir)
     work = Path(work)
     work.mkdir(parents=True, exist_ok=True)
+    spec = spec if spec is not None else load_spec(bundle_dir)
     repo = bundle_dir / "repo"
     witness = bundle_dir / "witness"
     ref_poc = _reference_poc(witness)
@@ -190,7 +242,7 @@ def _score_core(bundle_dir: Path, vulnerable_built: Path, poc: bytes, patch: byt
     if not applied:
         detail["patch_apply_error"] = apply_err
         return RepoE2EScore(False, "agent patch does not apply", detail)
-    built, build_log = _build_tree(bundle_dir, patched, timeout=timeout)
+    built, build_log = _build_tree(bundle_dir, patched, timeout=timeout, spec=spec)
     detail["patch_builds"] = built
     if not built:
         detail["patch_build_error"] = build_log
@@ -206,7 +258,7 @@ def _score_core(bundle_dir: Path, vulnerable_built: Path, poc: bytes, patch: byt
     detail["row2_poc_clean_on_patch"] = row2
     detail["row2_detail"] = r2.get("detail")
 
-    if _declared_public_tests(bundle_dir):
+    if declared_public_tests(spec=spec):
         base_ok, base_log = get_baseline()
         detail["row3_baseline_green_on_vulnerable"] = base_ok
         if not base_ok:
@@ -214,7 +266,7 @@ def _score_core(bundle_dir: Path, vulnerable_built: Path, poc: bytes, patch: byt
                 "public_tests are not green on the pristine vulnerable tree "
                 f"(case not e2e-ready, not an agent failure): {base_log}"
             )
-    row3, tests_log = _run_public_tests(bundle_dir, patched, timeout=timeout)
+    row3, tests_log = _run_public_tests(bundle_dir, patched, timeout=timeout, spec=spec)
     detail["row3_tests_pass_on_patch"] = row3
     if not row3:
         detail["row3_detail"] = tests_log
@@ -244,25 +296,20 @@ def score_repo_e2e(
     bundle_dir = Path(bundle_dir)
     work = Path(work)
     work.mkdir(parents=True, exist_ok=True)
-    repo = bundle_dir / "repo"
-    witness = bundle_dir / "witness"
-    if not (repo.is_dir() and (witness / _PROBE).is_file()):
-        raise ValueError(f"not a scorable e2e bundle (needs repo/ + witness/{_PROBE}): {bundle_dir}")
+    _require_scorable_bundle(bundle_dir)
+    spec = load_spec(bundle_dir)
 
     # Fresh-per-submission isolation: build a brand-new vulnerable tree for THIS
     # submission (no state shared with any other submission -- the property the
     # untrusted-agent server path wants).
     vulnerable = work / "vulnerable"
-    shutil.copytree(repo, vulnerable)
-    ok, log = _build_tree(bundle_dir, vulnerable, timeout=timeout)
-    if not ok:
-        raise RuntimeError(f"vulnerable tree failed to build (infra): {log}")
+    _build_vulnerable_tree(bundle_dir, vulnerable, timeout=timeout, spec=spec)
 
     def get_baseline():
-        return _run_public_tests(bundle_dir, vulnerable, timeout=timeout)
+        return _run_public_tests(bundle_dir, vulnerable, timeout=timeout, spec=spec)
 
     return _score_core(bundle_dir, vulnerable, poc, patch, work / "sub",
-                       timeout=timeout, get_baseline=get_baseline)
+                       timeout=timeout, get_baseline=get_baseline, spec=spec)
 
 
 class CaseContext:
@@ -285,17 +332,12 @@ class CaseContext:
         self.root = Path(root)
         self.root.mkdir(parents=True, exist_ok=True)
         self.timeout = timeout
-        repo = self.bundle_dir / "repo"
-        witness = self.bundle_dir / "witness"
-        if not (repo.is_dir() and (witness / _PROBE).is_file()):
-            raise ValueError(f"not a scorable e2e bundle (needs repo/ + witness/{_PROBE}): {self.bundle_dir}")
+        _require_scorable_bundle(self.bundle_dir)
+        self._spec = load_spec(self.bundle_dir)
 
         self.vulnerable = self.root / "vulnerable"
-        shutil.copytree(repo, self.vulnerable)
-        ok, log = _build_tree(self.bundle_dir, self.vulnerable, timeout=timeout)
+        _build_vulnerable_tree(self.bundle_dir, self.vulnerable, timeout=timeout, spec=self._spec)
         self.vulnerable_build_count = 1
-        if not ok:
-            raise RuntimeError(f"vulnerable tree failed to build (infra): {log}")
 
         # Establish the row-3 baseline on a DISPOSABLE COPY so self.vulnerable is
         # only ever `build`-run, never `public_tests`-run, before it is observed
@@ -304,11 +346,11 @@ class CaseContext:
         # --cache scoring cannot diverge from server scoring.
         self.baseline_checked_count = 0
         self.baseline_ok, self.baseline_log = True, ""
-        if _declared_public_tests(self.bundle_dir):
+        if declared_public_tests(spec=self._spec):
             base_tree = self.root / "baseline"
             shutil.copytree(self.vulnerable, base_tree)
             self.baseline_ok, self.baseline_log = _run_public_tests(
-                self.bundle_dir, base_tree, timeout=timeout)
+                self.bundle_dir, base_tree, timeout=timeout, spec=self._spec)
             shutil.rmtree(base_tree, ignore_errors=True)
             self.baseline_checked_count = 1
             if not self.baseline_ok:
@@ -323,7 +365,7 @@ class CaseContext:
         work = Path(work) if work is not None else self.root / f"sub{self._n}"
         return _score_core(
             self.bundle_dir, self.vulnerable, poc, patch, work,
-            timeout=timeout or self.timeout,
+            timeout=timeout or self.timeout, spec=self._spec,
             get_baseline=lambda: (self.baseline_ok, self.baseline_log))
 
     def close(self) -> None:
@@ -336,4 +378,5 @@ class CaseContext:
         self.close()
 
 
-__all__ = ["RepoE2EScore", "CaseContext", "is_case_ready", "score_repo_e2e"]
+__all__ = ["RepoE2EScore", "CaseContext", "is_case_ready", "readiness_reasons",
+           "score_repo_e2e", "load_spec", "declared_public_tests", "reference_poc_path"]

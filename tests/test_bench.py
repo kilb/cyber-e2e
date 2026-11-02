@@ -54,11 +54,21 @@ def test_bench_cached_context(tmp_path, toycase):
     e2e_bench.run_benchmark(
         bundles=[toycase], models=["fake-good"], n_trials=3,
         solver=good_solver, store=store, work_root=tmp_path / "w",
-        context_factory=factory, timeout=180)
+        score_context=factory, timeout=180)
     trials = R.load_trials(store)
     assert len(trials) == 3 and all(t["verdict"] == "PASS" for t in trials)
     # vulnerable tree built once for all three trials
     assert seen["ctx"].vulnerable_build_count == 1
+
+
+def test_bench_builtin_cached_context(tmp_path, toycase):
+    store = tmp_path / "trials.jsonl"
+    e2e_bench.run_benchmark(
+        bundles=[toycase], models=["fake-good"], n_trials=2,
+        solver=good_solver, store=store, work_root=tmp_path / "w",
+        score_context=e2e_bench.cached_context(tmp_path / "cache", 180), timeout=180)
+    trials = R.load_trials(store)
+    assert len(trials) == 2 and all(t["verdict"] == "PASS" for t in trials)
 
 
 def test_bench_broken_context_errors_all_trials(tmp_path, toycase):
@@ -70,7 +80,7 @@ def test_bench_broken_context_errors_all_trials(tmp_path, toycase):
     e2e_bench.run_benchmark(
         bundles=[toycase], models=["m"], n_trials=2,
         solver=good_solver, store=store, work_root=tmp_path / "w",
-        context_factory=bad_factory, timeout=180)
+        score_context=bad_factory, timeout=180)
     trials = R.load_trials(store)
     assert len(trials) == 2 and all(t["verdict"] == "ERROR" for t in trials)
     assert all("context build failed" in t["error"] for t in trials)

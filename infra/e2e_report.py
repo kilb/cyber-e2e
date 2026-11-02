@@ -23,6 +23,18 @@ def _ranked_models(agg):
     return sorted(agg["by_model"], key=lambda m: (-m.macro_pass1, -m.micro_pass1, m.model))
 
 
+def _ks_extra(ks):
+    return [k for k in ks if k != 1]  # pass@1 already has its own column
+
+
+def _sorted_cases(agg):
+    return sorted(agg["by_case_model"], key=lambda c: (c.case_id, -c.pass1, c.model))
+
+
+def _patk_cell(cm, k):
+    return _pct(cm.pass_at_k[k]) if k in cm.pass_at_k else "-"
+
+
 def render_markdown(agg: dict, title: str = "cybergym-e2e leaderboard") -> str:
     ks = agg["ks"]
     out = [f"# {title}", ""]
@@ -40,14 +52,14 @@ def render_markdown(agg: dict, title: str = "cybergym-e2e leaderboard") -> str:
 
     out.append("## Per-case results")
     out.append("")
-    ks_extra = [k for k in ks if k != 1]  # pass@1 already has its own column
+    ks_extra = _ks_extra(ks)
     kcols = [f"pass@{k}" for k in ks_extra]
     hdr2 = ["case", "model", "n", "pass@1", "95% CI", *kcols, "errors"]
     out.append("| " + " | ".join(hdr2) + " |")
     out.append("|" + "|".join(["---"] * len(hdr2)) + "|")
-    for cm in sorted(agg["by_case_model"], key=lambda c: (c.case_id, -c.pass1, c.model)):
+    for cm in _sorted_cases(agg):
         lo, hi = cm.ci
-        kvals = [(_pct(cm.pass_at_k[k]) if k in cm.pass_at_k else "-") for k in ks_extra]
+        kvals = [_patk_cell(cm, k) for k in ks_extra]
         out.append("| " + " | ".join([
             cm.case_id, cm.model, str(cm.n_valid), _pct(cm.pass1),
             f"[{_pct(lo)}, {_pct(hi)}]", *kvals, str(cm.n_error),
@@ -92,13 +104,12 @@ def render_html(agg: dict, title: str = "cybergym-e2e leaderboard") -> str:
             f"<td>{m.cases_solved_any}/{m.cases_attempted}</td>"
             f"<td>{m.n_valid}</td><td>{m.n_error}</td></tr>")
 
-    ks_extra = [k for k in ks if k != 1]  # pass@1 already has its own column
+    ks_extra = _ks_extra(ks)
     kcols = "".join(f"<th>pass@{k}</th>" for k in ks_extra)
     rows_case = []
-    for cm in sorted(agg["by_case_model"], key=lambda c: (c.case_id, -c.pass1, c.model)):
+    for cm in _sorted_cases(agg):
         lo, hi = cm.ci
-        kvals = "".join(
-            f"<td>{(_pct(cm.pass_at_k[k]) if k in cm.pass_at_k else '-')}</td>" for k in ks_extra)
+        kvals = "".join(f"<td>{_patk_cell(cm, k)}</td>" for k in ks_extra)
         rows_case.append(
             f"<tr><td>{e(cm.case_id)}</td><td class='model'>{e(cm.model)}</td>"
             f"<td>{cm.n_valid}</td><td>{_pct(cm.pass1)}{bar(cm.pass1)}</td>"

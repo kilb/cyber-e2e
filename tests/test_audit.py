@@ -106,22 +106,43 @@ def test_scan_content_false_skips_content_but_keeps_structural(tmp_path, toycase
 # ---- review-finding regressions ----
 
 def test_ordinary_source_names_not_flagged(tmp_path, toycase):
+    # The withheld-name check is derived from the actual witness/ basenames, so
+    # ordinary source whose name merely resembles an artifact prefix is NOT flagged.
     import shutil
     good = tmp_path / "g"
     shutil.copytree(toycase, good)
-    (good / "repo" / "narrow_window.c").write_text("int x;\n", encoding="utf-8")  # not narrow_patch/poc
-    (good / "repo" / "probe.py").write_text("print('hi')\n", encoding="utf-8")    # suspicious -> warning
+    (good / "repo" / "narrow_window.c").write_text("int x;\n", encoding="utf-8")
+    (good / "repo" / "probe.py").write_text("print('hi')\n", encoding="utf-8")
+    (good / "repo" / "model_poc_helper.py").write_text("x\n", encoding="utf-8")
     rep = e2e_audit.audit_case(good)
     assert rep.ok, rep.leaks
-    assert any("probe.py" in w for w in rep.warnings), rep.warnings
 
 
-def test_model_poc_prefix_still_flagged(tmp_path, toycase):
+def test_detects_renamed_copy_of_withheld_artifact(tmp_path, toycase):
+    # A byte-identical copy of the oracle under an innocent name is the leak that
+    # matters most and the one a name denylist misses -> caught by content hash.
     import shutil
     bad = tmp_path / "b"
     shutil.copytree(toycase, bad)
-    (bad / "repo" / "model_poc_helper.py").write_text("x\n", encoding="utf-8")
-    assert not e2e_audit.audit_case(bad).ok
+    shutil.copy(bad / "witness" / "e2e_probe.py", bad / "repo" / "helper_xyz.py")
+    rep = e2e_audit.audit_case(bad)
+    assert not rep.ok
+    assert any("byte-identical copy of withheld e2e_probe.py" in leak for leak in rep.leaks), rep.leaks
+
+
+def test_declared_fix_commit_is_location_independent(tmp_path, toycase):
+    # A fix-commit declared in build.yaml `vulnerability:` is a secret regardless
+    # of where it leaks (no NOTES.md needed) -- the altitude fix for the old
+    # hashes-only-from-NOTES asymmetry.
+    import shutil
+    bad = tmp_path / "decl"
+    shutil.copytree(toycase, bad)
+    h = "deadbeefcafe1234"  # 16 hex, not in NOTES.md
+    (bad / "build.yaml").write_text(
+        (bad / "build.yaml").read_text() + f"\nvulnerability:\n  fix_commit: {h}\n", encoding="utf-8")
+    (bad / "repo" / "VERSION").write_text(f"rev {h}\n", encoding="utf-8")
+    rep = e2e_audit.audit_case(bad)
+    assert not rep.ok and any(h in leak for leak in rep.leaks), rep.leaks
 
 
 def test_sha256_commit_leak_detected(tmp_path, toycase):
