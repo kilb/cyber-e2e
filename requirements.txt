@@ -1,0 +1,5 @@
+# cybergym-e2e runtime dependencies (scoring server + harness)
+pyyaml>=6.0
+fastapi>=0.110
+uvicorn>=0.29
+python-multipart>=0.0.9

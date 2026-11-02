@@ -25,36 +25,61 @@ in-flight blind-test runs on blk.so.
   vulnerability material already built in `../RepoRepairGym`'s PoC-gen work as
   raw source candidates, but with its own submission contract and scoring.
 
-## Division of labor (unchanged project rule, carried over)
+## Division of labor
 
-Claude (coordinator) does NOT author exploit/oracle/harness code. All PoC,
-patch-scoring-oracle, and vulnerability-trigger logic is built by the GLM worker
-on blk.so (`ubuntu@blk.so`, `~/.glm`, model `glm-5.3-prime`). Claude does: this
-spec, environment/handoff docs, case inventory curation, read-only review,
-authoritative re-validation via the real scorer, and non-oracle infra scaffolding
-(sandboxing, server wiring, directory layout).
+- **Triggering content** — the reference PoC (`witness/model_poc_reference.*`) that
+  actually drives the bug, and each per-case narrow control — is authored by the
+  GLM worker on blk.so (`ubuntu@blk.so`, `~/.glm`, model `glm-5.3-prime`).
+- **Harness + observe-only glue** — all of `infra/` (the scorer orchestration,
+  the submission server, the audit/certify/results/report/bench harness,
+  sandboxing), plus the *observe-only* oracle (`witness/e2e_probe.py`, which only
+  decides whether the specific bug fired) and the row-3 test harness — is built on
+  the framework side. None of it contains triggering logic.
+- Claude also runs **certification** (the a-priori controls) and **re-validation**
+  through the real scorer; a case is never trusted on a self-report.
+
+See `docs/architecture.md` for the full component map and trust boundaries.
 
 ## Repo layout
 
-- `docs/` — handoff specs for the GLM worker: task contract, environment,
-  per-case authoring contract, case inventory, known gotchas.
-- `infra/` — the vulnerability-agnostic framework (Claude-authored plumbing):
-  - `server.py` — e2e submission API (lease a source-only case, accept a
-    `(poc, patch)` pair, enqueue a job, return the 4-row verdict).
-  - `repo_e2e_task.py` — the 4-row scoring orchestration: build the vulnerable
-    tree, git-apply the agent's patch and build it, invoke the per-case oracle
-    as an opaque subprocess for rows 1/2/4, run the project's own test suite for
-    row 3, AND the four booleans.
-  - `e2e_local.py` — local runner: lease a case, drive the agent CLI with a
-    no-hints prompt, collect `out/poc` + `out/fix.patch`, submit, record a
-    durable `summary.json`.
-  - `start_server.sh` — (re)start uvicorn on port 8900.
-  - `sandbox_wrapper.sh` — unprivileged bwrap sandbox (PID-isolated) for one
-    agent run.
-- `cases/` — one directory per e2e case once built (empty for now). Each case's
-  `witness/e2e_probe.py` (the oracle), `witness/model_poc_reference.*` (the
-  ground-truth PoC), real `build.yaml` recipe and real `public_tests` are
-  authored by the GLM worker per `docs/case-authoring.md` — NOT by Claude.
+- `docs/` — specs: `architecture.md` (the harness architecture), `task-contract.md`,
+  `environment.md`, `case-authoring.md` (per-case contract), `case-inventory.md`,
+  `handoff-batch-1.md` (raw-material conversion handoff).
+- `infra/` — the vulnerability-agnostic framework:
+  - **Scoring**
+    - `repo_e2e_task.py` — the 4-row scorer. `score_repo_e2e` (fresh per
+      submission, full isolation) and `CaseContext` (builds the vulnerable tree +
+      row-3 baseline once, reused across a case's trials) share one `_score_core`.
+      Invokes the per-case oracle as an opaque subprocess.
+    - `server.py` — submission API: serves `repo/` ONLY, discovery gated on the
+      leak audit, async job queue.
+  - **Harness (SOTA layer)**
+    - `e2e_audit.py` — leakage + readiness audit; the single `served_source_files`
+      definition the server reuses; `case_fingerprint`.
+    - `e2e_certify.py` — accepted / no-op / narrow controls via the real scorer.
+    - `e2e_results.py` — durable JSONL trial store; pass@1 (Wilson CI) + pass@k
+      (unbiased estimator); aggregation; run manifest.
+    - `e2e_report.py` — markdown + self-contained HTML leaderboard.
+    - `e2e_bench.py` — N-trials-per-(case,model) runner; pluggable solver/scorer;
+      `--cache`; writes a reproducibility manifest + leaderboard.
+    - `e2e_local.py` — single-run convenience runner.
+  - **Ops** — `start_server.sh` (uvicorn on 8900), `sandbox_wrapper.sh`
+    (unprivileged PID-isolated bwrap).
+- `tests/` — pytest suite (30 tests). `tests/fixtures/toycase` is a synthetic
+  fully-converted case that certifies the whole pipeline in seconds.
+- `cases/` — one directory per e2e case once built (empty here; the 1.8 GB trees
+  live on blk.so). Each case's observe-only `witness/e2e_probe.py`, row-3
+  `public_tests`, and triggering `witness/model_poc_reference.*` are authored per
+  `docs/case-authoring.md` (triggering PoC by the GLM worker).
+
+## Quickstart
+
+```sh
+python -m venv .venv && . .venv/bin/activate
+pip install -r requirements-dev.txt
+python -m pytest                                  # 30 tests (~3s; needs a C compiler)
+python infra/e2e_certify.py tests/fixtures/toycase   # certify the self-test case
+```
 
 ### Raw material staged (batch 1), conversion NOT done
 
