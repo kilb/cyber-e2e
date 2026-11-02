@@ -42,6 +42,9 @@ if str(ROOT) not in sys.path:
 # harness and tests -- no importlib-by-path dance, no duplicate RepoE2EScore class.
 import repo_e2e_task as _task  # noqa: E402
 import e2e_audit  # noqa: E402 -- shares the served-payload selection + leak audit
+import e2e_results as _results  # noqa: E402 -- optional durable result store
+
+_ROW_KEYS = _results.ROW_KEYS
 
 
 def _discover_cases() -> tuple[str, ...]:
@@ -83,10 +86,19 @@ API_KEY = os.environ.get("E2E_API_KEY", "")
 if not API_KEY:
     raise RuntimeError("E2E_API_KEY must be set in the environment")
 
+# Optional durable record of every scored submission (the in-memory job store is
+# TTL-capped and lost on restart; set E2E_RESULTS to keep an append-only JSONL).
+RESULTS_STORE = os.environ.get("E2E_RESULTS", "")
+
 app = FastAPI(title="cybergym-e2e test API", version="0.1.0")
 _executor = ThreadPoolExecutor(max_workers=MAX_CONCURRENT_JOBS)
 _jobs: dict[str, dict[str, Any]] = {}
 _jobs_lock = threading.Lock()
+# source.zip is deterministic for a given case for the server's lifetime (case
+# trees change only across a restart, by the restart-to-register discipline), so
+# memoize the packed bytes instead of re-walking + re-deflating repo/ per request.
+_zip_cache: dict[str, bytes] = {}
+_zip_lock = threading.Lock()
 
 
 def _require_api_key(x_api_key: str | None) -> None:
@@ -138,13 +150,39 @@ def _public_view(case_id: str) -> dict[str, Any]:
 
 def _zip_source_only(case_id: str) -> bytes:
     """The agent download: ONLY repo/. Never build.yaml-with-answers, task.md,
-    fix.patch, or witness/."""
+    fix.patch, or witness/. Memoized per case for the server's lifetime."""
+    cached = _zip_cache.get(case_id)
+    if cached is not None:
+        return cached
     bundle = _bundle_dir(case_id)
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
         for path in e2e_audit.served_source_files(bundle):
             zf.write(path, arcname=str(path.relative_to(bundle)))
-    return buf.getvalue()
+    data = buf.getvalue()
+    with _zip_lock:
+        _zip_cache[case_id] = data
+    return data
+
+
+def _persist_result(job_id: str, case_id: str, result: dict | None, error: str | None) -> None:
+    """Append a durable trial record for this submission if E2E_RESULTS is set.
+    Best-effort: a store write failure must never fail the job."""
+    if not RESULTS_STORE:
+        return
+    detail = (result or {}).get("detail") or {}
+    accepted = (result or {}).get("accepted")
+    verdict = "ERROR" if error else ("PASS" if accepted else "FAIL")
+    try:
+        _results.append_trial(RESULTS_STORE, {
+            "case_id": case_id, "job_id": job_id, "source": "server",
+            "verdict": verdict, "accepted": accepted,
+            "reason": (result or {}).get("reason"),
+            "rows": {k: detail.get(k) for k in _ROW_KEYS},
+            "error": error,
+        })
+    except Exception:  # noqa: BLE001 -- durability is best-effort, never fatal
+        pass
 
 
 def _run_job(job_id: str, case_id: str, poc: bytes, patch: bytes) -> None:
@@ -152,6 +190,8 @@ def _run_job(job_id: str, case_id: str, poc: bytes, patch: bytes) -> None:
         _jobs[job_id]["status"] = "running"
         _jobs[job_id]["started_at"] = time.time()
     work = WORK_ROOT / job_id
+    result = None
+    error = None
     try:
         bundle = CASES_ROOT / case_id
         score = _task.score_repo_e2e(bundle, poc, patch, work, timeout=SCORE_TIMEOUT_SECONDS)
@@ -160,11 +200,13 @@ def _run_job(job_id: str, case_id: str, poc: bytes, patch: bytes) -> None:
             _jobs[job_id]["status"] = "done"
             _jobs[job_id]["result"] = result
     except Exception as exc:  # noqa: BLE001
+        error = f"{type(exc).__name__}: {exc}"[-2000:]
         with _jobs_lock:
             _jobs[job_id]["status"] = "error"
-            _jobs[job_id]["error"] = f"{type(exc).__name__}: {exc}"[-2000:]
+            _jobs[job_id]["error"] = error
     finally:
         shutil.rmtree(work, ignore_errors=True)
+        _persist_result(job_id, case_id, result, error)
         with _jobs_lock:
             _jobs[job_id]["finished_at"] = time.time()
 

@@ -39,11 +39,7 @@ import e2e_report  # noqa: E402
 import e2e_results as R  # noqa: E402
 import repo_e2e_task as scorer_mod  # noqa: E402
 
-_ROW_KEYS = (
-    "patch_applies", "patch_builds",
-    "row1_poc_faults_vulnerable", "row2_poc_clean_on_patch",
-    "row3_tests_pass_on_patch", "row4_reference_clean_on_patch",
-)
+_ROW_KEYS = R.ROW_KEYS  # canonical trial-record row shape
 
 
 # --------------------------------------------------------------------------- #

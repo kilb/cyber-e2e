@@ -138,6 +138,32 @@ certified iff all pass:
 - **Row-3 baseline guard**: the suite must be green on the pristine vulnerable
   tree first; a red baseline is a case defect (raised as an infra error), not an
   agent failure, so it never wrongly rejects every patch.
+- **Patch application is enclosing-repo-immune**: `git apply` runs with
+  `GIT_CEILING_DIRECTORIES` set to the work tree's parent. Without this, when the
+  work dir sits inside another git checkout (e.g. the server's `WORK_ROOT` under
+  this project's repo) `git apply` discovers the outer repo and silently applies
+  nothing while returning 0 — every patch becomes a no-op and every submission is
+  wrongly rejected.
+- **Per-job TMPDIR**: each submission's build/test/oracle steps run with
+  `TMPDIR` pointed at a private dir under the job's work dir, never the host's
+  shared `/tmp`, so concurrent jobs cannot collide on a conventional temp path
+  (the cross-session `/tmp` collision the project hit before; see environment.md).
+- **Tolerant oracle parse**: `_observe` reads the LAST non-empty stdout line as
+  the JSON observation, so a noisy oracle that prints a diagnostic first is fine;
+  non-JSON output is a hard error.
+
+## Trust model & isolation
+
+Leak prevention keeps the *answer* from the agent; it does not sandbox execution.
+Scoring **runs agent-influenced code**: it builds a target from (vulnerable
+source + the agent's patch) and the oracle runs that binary on the agent's PoC
+input. The harness isolates *between jobs* (fresh trees, per-job TMPDIR, and the
+agent run itself goes through `sandbox_wrapper.sh`), but it does **not** by itself
+contain a maliciously-crafted patch/PoC that executes code during build or run.
+For evaluating untrusted agents, run the scorer inside a container/VM at the
+deployment layer (the one strong isolation boundary this environment's bwrap —
+PID-only, shared FS/network — cannot provide). The trusted-orchestration use
+(Claude/GLM on blk.so) does not need this.
 
 ## Metrics methodology
 
@@ -155,7 +181,12 @@ certified iff all pass:
 - `e2e_results.write_manifest` — per-run record of host/toolchain + config +
   per-case fingerprints, written next to the trial store.
 - The durable JSONL store is the trusted record (the live server job store is
-  lossy by design — see `docs/environment.md`).
+  lossy by design — see `docs/environment.md`). The server optionally mirrors every
+  scored submission to its own append-only store when `E2E_RESULTS` is set, so a
+  server deployment also keeps a durable record, not just the TTL-capped job map.
+- The server memoizes `source.zip` per case for its lifetime (trees change only
+  across a restart, by the restart-to-register discipline), so repeated agent
+  downloads don't re-walk and re-deflate `repo/`.
 
 ## Self-test case
 

@@ -28,6 +28,14 @@ from pathlib import Path
 TRIAL_SCHEMA = "cybergym-e2e.trial/v1"
 MANIFEST_SCHEMA = "cybergym-e2e.manifest/v1"
 
+# The 4-row matrix booleans a trial record carries under "rows" (canonical here so
+# the bench runner and the server record the same shape).
+ROW_KEYS = (
+    "patch_applies", "patch_builds",
+    "row1_poc_faults_vulnerable", "row2_poc_clean_on_patch",
+    "row3_tests_pass_on_patch", "row4_reference_clean_on_patch",
+)
+
 
 def _utcnow() -> str:
     return _dt.datetime.now(_dt.timezone.utc).isoformat()
@@ -213,5 +221,5 @@ def aggregate(trials: list[dict], ks: tuple = (1, 5, 10)) -> dict:
 
 
 __all__ = ["pass_at_k", "wilson_ci", "sha256", "append_trial", "load_trials",
-           "aggregate", "CaseModelAgg", "ModelAgg", "TRIAL_SCHEMA",
+           "aggregate", "CaseModelAgg", "ModelAgg", "TRIAL_SCHEMA", "ROW_KEYS",
            "environment_manifest", "write_manifest", "MANIFEST_SCHEMA"]

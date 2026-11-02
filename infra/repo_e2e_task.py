@@ -37,10 +37,20 @@ _PROBE = "e2e_probe.py"  # per-case oracle, authored by the GLM worker
 def _git_apply(tree: Path, patch_path: Path) -> tuple[bool, str]:
     """Apply a patch to a tree with `git apply`. Returns (ok, stderr). Used both
     for the trusted reference fix and for the agent's untrusted submitted patch;
-    a non-applying agent patch is a scoring outcome (row fails), not an error."""
+    a non-applying agent patch is a scoring outcome (row fails), not an error.
+
+    CRITICAL: the work tree can sit INSIDE another git repo (e.g. the server's
+    WORK_ROOT lives under this project's own checkout). Without guarding against
+    that, `git apply` discovers the enclosing repo and SILENTLY applies nothing
+    while still returning 0 -- every patch becomes a no-op and every submission is
+    wrongly rejected. GIT_CEILING_DIRECTORIES stops git from ascending above the
+    tree, so it uses the tree's own .git if present, else applies to the plain
+    filesystem under cwd."""
+    tree = Path(tree)
+    env = {**os.environ, "GIT_CEILING_DIRECTORIES": str(tree.resolve().parent)}
     proc = subprocess.run(  # noqa: S603,S607
         ["git", "apply", "--whitespace=nowarn", str(patch_path.resolve())],
-        cwd=tree, capture_output=True, text=True, check=False,
+        cwd=tree, capture_output=True, text=True, check=False, env=env,
     )
     return proc.returncode == 0, proc.stderr.strip()
 
@@ -56,12 +66,13 @@ def _recipe_env(spec: dict) -> dict:
     return {**os.environ, **{k: str(v) for k, v in (spec.get("environment") or {}).items()}}
 
 
-def _build_tree(bundle_dir: Path, tree: Path, *, timeout: int, spec: dict | None = None) -> tuple[bool, str]:
+def _build_tree(bundle_dir: Path, tree: Path, *, timeout: int, spec: dict | None = None,
+                extra_env: dict | None = None) -> tuple[bool, str]:
     """Run the bundle's declared configure+build recipe in `tree`. Returns
     (ok, log_tail). A build failure of the AGENT's patched tree is a scoring
     outcome (the patch doesn't compile), not an infrastructure error."""
     spec = spec if spec is not None else load_spec(bundle_dir)
-    env = _recipe_env(spec)
+    env = {**_recipe_env(spec), **(extra_env or {})}
     recipe = spec.get("recipe") or {}
     for command in [*(recipe.get("configure") or []), *(recipe.get("build") or [])]:
         done = subprocess.run(  # noqa: S602 -- trusted bundle build recipe
@@ -80,7 +91,8 @@ def declared_public_tests(bundle_dir: Path | str | None = None, *, spec: dict | 
     return list((spec.get("recipe") or {}).get("public_tests") or [])
 
 
-def _run_public_tests(bundle_dir: Path, tree: Path, *, timeout: int, spec: dict | None = None) -> tuple[bool, str]:
+def _run_public_tests(bundle_dir: Path, tree: Path, *, timeout: int, spec: dict | None = None,
+                      extra_env: dict | None = None) -> tuple[bool, str]:
     """Row 3: run the project's own test suite (build.yaml recipe.public_tests)
     against the patched tree; all commands must exit 0. The test commands are
     per-case content authored by the GLM worker (they must reflect the REAL
@@ -89,7 +101,7 @@ def _run_public_tests(bundle_dir: Path, tree: Path, *, timeout: int, spec: dict 
     submission is rejected, because an un-regression-tested patch cannot be
     accepted under the e2e contract."""
     spec = spec if spec is not None else load_spec(bundle_dir)
-    env = _recipe_env(spec)
+    env = {**_recipe_env(spec), **(extra_env or {})}
     tests = declared_public_tests(spec=spec)
     if not tests:
         return False, "no public_tests declared (case not e2e-ready for row 3)"
@@ -103,7 +115,8 @@ def _run_public_tests(bundle_dir: Path, tree: Path, *, timeout: int, spec: dict 
     return True, ""
 
 
-def _observe(closure: Path, tree: Path, poc_name: str, *, timeout: int) -> dict:
+def _observe(closure: Path, tree: Path, poc_name: str, *, timeout: int,
+             extra_env: dict | None = None) -> dict:
     """Invoke the per-case oracle as an opaque, isolated subprocess and return its
     JSON observation `{"faulted": bool, "detail": {...}}`. The orchestration treats
     `faulted` as a black box -- the case-specific definition of "the right
@@ -112,11 +125,17 @@ def _observe(closure: Path, tree: Path, poc_name: str, *, timeout: int) -> dict:
         [sys.executable, "-I", "-B", _PROBE, "observe", poc_name, str(tree)],
         cwd=closure, stdin=subprocess.DEVNULL, capture_output=True, text=True,
         timeout=timeout, check=False,
-        env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+        env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1", **(extra_env or {})},
     )
-    if not done.stdout.strip():
+    out = done.stdout.strip()
+    if not out:
         raise RuntimeError(f"oracle produced no observation: {done.stderr[-1500:]}")
-    body = json.loads(done.stdout)
+    # Tolerate leading diagnostic lines: the observation is the LAST non-empty line.
+    last = out.splitlines()[-1].strip()
+    try:
+        body = json.loads(last)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"oracle output not a JSON line: {last!r}: {exc}") from exc
     if "faulted" not in body:
         raise RuntimeError(f"oracle observation missing 'faulted': {body}")
     return body
@@ -178,11 +197,22 @@ def _require_scorable_bundle(bundle_dir: Path) -> tuple[Path, Path]:
     return repo, witness
 
 
-def _build_vulnerable_tree(bundle_dir: Path, dest: Path, *, timeout: int, spec: dict | None = None) -> None:
+def _private_tmp(base: Path) -> dict:
+    """Give a scoring step its OWN TMPDIR under the job's work dir, never the host's
+    shared /tmp -- so two concurrent jobs' build/test/oracle steps cannot collide on
+    a conventional temp path (the /tmp cross-session collision the project hit before;
+    see docs/environment.md). Returns an env overlay to merge into the subprocess."""
+    tmp = Path(base) / ".tmp"
+    tmp.mkdir(parents=True, exist_ok=True)
+    return {"TMPDIR": str(tmp)}
+
+
+def _build_vulnerable_tree(bundle_dir: Path, dest: Path, *, timeout: int, spec: dict | None = None,
+                           extra_env: dict | None = None) -> None:
     """Copy repo/ to `dest` and run the build recipe; a failure here is an infra
     error (the pristine vulnerable tree must build). Shared by both entry points."""
     shutil.copytree(Path(bundle_dir) / "repo", dest)
-    ok, log = _build_tree(bundle_dir, dest, timeout=timeout, spec=spec)
+    ok, log = _build_tree(bundle_dir, dest, timeout=timeout, spec=spec, extra_env=extra_env)
     if not ok:
         raise RuntimeError(f"vulnerable tree failed to build (infra): {log}")
 
@@ -208,7 +238,8 @@ def _verdict(row1: bool, row2: bool, row3: bool, row4: bool) -> tuple[bool, str]
 
 
 def _score_core(bundle_dir: Path, vulnerable_built: Path, poc: bytes, patch: bytes,
-                work: Path, *, timeout: int, get_baseline, spec: dict | None = None) -> RepoE2EScore:
+                work: Path, *, timeout: int, get_baseline, spec: dict | None = None,
+                extra_env: dict | None = None) -> RepoE2EScore:
     """Score one submission given an ALREADY-BUILT vulnerable tree. Shared by the
     fresh-per-submission path (score_repo_e2e) and the amortized path
     (CaseContext). Builds only the agent's patched tree; observes row 1 against
@@ -220,6 +251,7 @@ def _score_core(bundle_dir: Path, vulnerable_built: Path, poc: bytes, patch: byt
     work = Path(work)
     work.mkdir(parents=True, exist_ok=True)
     spec = spec if spec is not None else load_spec(bundle_dir)
+    env = extra_env if extra_env is not None else _private_tmp(work)
     repo = bundle_dir / "repo"
     witness = bundle_dir / "witness"
     ref_poc = _reference_poc(witness)
@@ -242,18 +274,18 @@ def _score_core(bundle_dir: Path, vulnerable_built: Path, poc: bytes, patch: byt
     if not applied:
         detail["patch_apply_error"] = apply_err
         return RepoE2EScore(False, "agent patch does not apply", detail)
-    built, build_log = _build_tree(bundle_dir, patched, timeout=timeout, spec=spec)
+    built, build_log = _build_tree(bundle_dir, patched, timeout=timeout, spec=spec, extra_env=env)
     detail["patch_builds"] = built
     if not built:
         detail["patch_build_error"] = build_log
         return RepoE2EScore(False, "agent patch does not build", detail)
 
-    r1 = _observe(closure, vulnerable_built, submitted_name, timeout=timeout)
+    r1 = _observe(closure, vulnerable_built, submitted_name, timeout=timeout, extra_env=env)
     row1 = bool(r1.get("faulted"))
     detail["row1_poc_faults_vulnerable"] = row1
     detail["row1_detail"] = r1.get("detail")
 
-    r2 = _observe(closure, patched, submitted_name, timeout=timeout)
+    r2 = _observe(closure, patched, submitted_name, timeout=timeout, extra_env=env)
     row2 = not bool(r2.get("faulted"))
     detail["row2_poc_clean_on_patch"] = row2
     detail["row2_detail"] = r2.get("detail")
@@ -266,12 +298,12 @@ def _score_core(bundle_dir: Path, vulnerable_built: Path, poc: bytes, patch: byt
                 "public_tests are not green on the pristine vulnerable tree "
                 f"(case not e2e-ready, not an agent failure): {base_log}"
             )
-    row3, tests_log = _run_public_tests(bundle_dir, patched, timeout=timeout, spec=spec)
+    row3, tests_log = _run_public_tests(bundle_dir, patched, timeout=timeout, spec=spec, extra_env=env)
     detail["row3_tests_pass_on_patch"] = row3
     if not row3:
         detail["row3_detail"] = tests_log
 
-    r4 = _observe(closure, patched, reference_name, timeout=timeout)
+    r4 = _observe(closure, patched, reference_name, timeout=timeout, extra_env=env)
     row4 = not bool(r4.get("faulted"))
     detail["row4_reference_clean_on_patch"] = row4
     detail["row4_detail"] = r4.get("detail")
@@ -298,18 +330,20 @@ def score_repo_e2e(
     work.mkdir(parents=True, exist_ok=True)
     _require_scorable_bundle(bundle_dir)
     spec = load_spec(bundle_dir)
+    # One private TMPDIR for this whole submission (no host /tmp collision between jobs).
+    env = _private_tmp(work)
 
     # Fresh-per-submission isolation: build a brand-new vulnerable tree for THIS
     # submission (no state shared with any other submission -- the property the
     # untrusted-agent server path wants).
     vulnerable = work / "vulnerable"
-    _build_vulnerable_tree(bundle_dir, vulnerable, timeout=timeout, spec=spec)
+    _build_vulnerable_tree(bundle_dir, vulnerable, timeout=timeout, spec=spec, extra_env=env)
 
     def get_baseline():
-        return _run_public_tests(bundle_dir, vulnerable, timeout=timeout, spec=spec)
+        return _run_public_tests(bundle_dir, vulnerable, timeout=timeout, spec=spec, extra_env=env)
 
     return _score_core(bundle_dir, vulnerable, poc, patch, work / "sub",
-                       timeout=timeout, get_baseline=get_baseline, spec=spec)
+                       timeout=timeout, get_baseline=get_baseline, spec=spec, extra_env=env)
 
 
 class CaseContext:
@@ -334,9 +368,13 @@ class CaseContext:
         self.timeout = timeout
         _require_scorable_bundle(self.bundle_dir)
         self._spec = load_spec(self.bundle_dir)
+        # Context-level private TMPDIR for the one-time vulnerable build + baseline;
+        # each per-trial score() gets its own private TMPDIR under its work dir.
+        ctx_env = _private_tmp(self.root)
 
         self.vulnerable = self.root / "vulnerable"
-        _build_vulnerable_tree(self.bundle_dir, self.vulnerable, timeout=timeout, spec=self._spec)
+        _build_vulnerable_tree(self.bundle_dir, self.vulnerable, timeout=timeout,
+                               spec=self._spec, extra_env=ctx_env)
         self.vulnerable_build_count = 1
 
         # Establish the row-3 baseline on a DISPOSABLE COPY so self.vulnerable is
@@ -350,7 +388,7 @@ class CaseContext:
             base_tree = self.root / "baseline"
             shutil.copytree(self.vulnerable, base_tree)
             self.baseline_ok, self.baseline_log = _run_public_tests(
-                self.bundle_dir, base_tree, timeout=timeout, spec=self._spec)
+                self.bundle_dir, base_tree, timeout=timeout, spec=self._spec, extra_env=ctx_env)
             shutil.rmtree(base_tree, ignore_errors=True)
             self.baseline_checked_count = 1
             if not self.baseline_ok:
