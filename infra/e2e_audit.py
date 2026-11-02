@@ -29,7 +29,7 @@ from pathlib import Path
 SERVED_EXCLUDE_DIRS = frozenset({".git", ".rrg-build", ".tmp"})
 
 # Answer artifacts that must never appear inside the served repo/ tree.
-_ANSWER_NAME_RE = re.compile(r"(e2e_probe|model_poc|narrow_patch|probe\.py|fix\.patch|NOTES\.md)", re.I)
+_ANSWER_NAME_RE = re.compile(r"(e2e_probe|model_poc|narrow_|probe\.py|fix\.patch|NOTES\.md)", re.I)
 _ANSWER_PATH_PARTS = frozenset({"witness", ".git"})
 
 _CVE_RE = re.compile(rb"CVE-\d{4}-\d{3,}", re.I)
