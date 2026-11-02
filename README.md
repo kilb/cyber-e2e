@@ -56,13 +56,17 @@ authoritative re-validation via the real scorer, and non-oracle infra scaffoldin
   ground-truth PoC), real `build.yaml` recipe and real `public_tests` are
   authored by the GLM worker per `docs/case-authoring.md` — NOT by Claude.
 
-### What is NOT here yet (intentionally — it's GLM's half)
+### Raw material staged (batch 1), conversion NOT done
 
-The framework is complete and compiles, but there are zero live cases: no
-`e2e_probe.py` oracle, no reference PoC, no real per-case build/test recipe has
-been written, because authoring those is the GLM worker's job. The next step is
-to stand this up on blk.so (`~/rrg-e2e`, port 8900) and hand the first pilot
-case to GLM to author against `docs/case-authoring.md`.
+20 certified sibling-project cases (every built case except the protected
+`wolfssl-ocsp-serial-length-confusion-001`) have been copied as **raw material**
+to `ubuntu@blk.so:~/rrg-e2e/cases/` (1.8 GB — source trees live on blk.so, not in
+this git repo). They are PoC-gen cases, **not yet e2e cases**: each still needs
+`witness/e2e_probe.py`, a real `build.yaml` `public_tests` (row 3), and — for 7 of
+them — a row-4 reference PoC. See `docs/handoff-batch-1.md` for the full table
+and per-case caveats. Authoring that conversion is the GLM worker's job per
+`docs/case-authoring.md`; Claude does not write oracle/PoC content. The e2e
+server has not been started.
 
 ## Execution environment
 
