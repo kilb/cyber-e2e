@@ -29,3 +29,13 @@ def test_html_is_selfcontained():
     assert "glm-5.3-prime" in html and "toycase" in html
     # self-contained: no external script/style URLs
     assert "http://" not in html and "https://" not in html
+
+
+def test_report_shows_mode_and_cost_columns():
+    trials = [{"case_id": "toy", "model": "m", "mode": "patch-only", "verdict": "PASS",
+               "accepted": True, "tokens": 1200, "usd_cost": 0.12, "solve_s": 9}]
+    agg = R.aggregate(trials, ks=(1,))
+    md = e2e_report.render_markdown(agg)
+    assert "mode" in md and "patch-only" in md and "avg $" in md and "$0.12" in md
+    html = e2e_report.render_html(agg)
+    assert "patch-only" in html and "avg tok" in html

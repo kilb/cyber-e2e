@@ -150,10 +150,14 @@ def load_trials(store: Path | str) -> list[dict]:
 # --------------------------------------------------------------------------- #
 # aggregation
 # --------------------------------------------------------------------------- #
+_COST_KEYS = ("solve_s", "tokens", "usd_cost", "llm_requests")
+
+
 @dataclasses.dataclass
 class CaseModelAgg:
     case_id: str
     model: str
+    mode: str
     n_total: int
     n_valid: int          # PASS + FAIL (ERROR excluded)
     successes: int
@@ -161,17 +165,20 @@ class CaseModelAgg:
     pass1: float
     ci: tuple
     pass_at_k: dict       # {k: value} over valid trials
+    cost: dict            # {metric: mean-over-valid-trials-with-the-metric or None}
 
 
 @dataclasses.dataclass
 class ModelAgg:
     model: str
+    mode: str
     cases_attempted: int
     cases_solved_any: int        # cases with >=1 PASS
     macro_pass1: float           # mean over cases of case pass1
     micro_pass1: float           # pooled successes / pooled valid trials
     n_valid: int
     n_error: int
+    cost: dict                   # {metric: mean over valid trials or None}
 
 
 def _is_pass(t: dict) -> bool:
@@ -182,13 +189,24 @@ def _is_error(t: dict) -> bool:
     return t.get("verdict") == "ERROR"
 
 
+def _mean(values: list) -> float | None:
+    nums = [v for v in values if isinstance(v, (int, float))]
+    return (sum(nums) / len(nums)) if nums else None
+
+
+def _cost_means(trials: list[dict]) -> dict:
+    return {k: _mean([t.get(k) for t in trials]) for k in _COST_KEYS}
+
+
 def aggregate(trials: list[dict], ks: tuple = (1, 5, 10)) -> dict:
-    by_cm: dict[tuple, list] = {}
+    # group by (case, model, mode) -- upstream reports e2e and patch-only separately
+    by_cmm: dict[tuple, list] = {}
     for t in trials:
-        by_cm.setdefault((t.get("case_id"), t.get("model")), []).append(t)
+        key = (t.get("case_id"), t.get("model"), t.get("mode") or "e2e")
+        by_cmm.setdefault(key, []).append(t)
 
     case_model = []
-    for (case_id, model), ts in sorted(by_cm.items(), key=lambda kv: (str(kv[0][0]), str(kv[0][1]))):
+    for (case_id, model, mode), ts in sorted(by_cmm.items(), key=lambda kv: tuple(map(str, kv[0]))):
         n_total = len(ts)
         n_error = sum(1 for t in ts if _is_error(t))
         valid = [t for t in ts if not _is_error(t)]
@@ -197,15 +215,19 @@ def aggregate(trials: list[dict], ks: tuple = (1, 5, 10)) -> dict:
         pass1 = (successes / n_valid) if n_valid else 0.0
         patk = {k: pass_at_k(n_valid, successes, k) for k in ks if k <= n_valid} if n_valid else {}
         case_model.append(CaseModelAgg(
-            case_id=case_id, model=model, n_total=n_total, n_valid=n_valid,
+            case_id=case_id, model=model, mode=mode, n_total=n_total, n_valid=n_valid,
             successes=successes, n_error=n_error, pass1=pass1,
-            ci=wilson_ci(successes, n_valid), pass_at_k=patk))
+            ci=wilson_ci(successes, n_valid), pass_at_k=patk, cost=_cost_means(valid)))
 
-    by_model: dict[str, list] = {}
+    by_model: dict[tuple, list] = {}
     for cm in case_model:
-        by_model.setdefault(cm.model, []).append(cm)
+        by_model.setdefault((cm.model, cm.mode), []).append(cm)
+    pooled_valid_trials: dict[tuple, list] = {}
+    for t in trials:
+        if not _is_error(t):
+            pooled_valid_trials.setdefault((t.get("model"), t.get("mode") or "e2e"), []).append(t)
     model_aggs = []
-    for model, cms in sorted(by_model.items(), key=lambda kv: str(kv[0])):
+    for (model, mode), cms in sorted(by_model.items(), key=lambda kv: tuple(map(str, kv[0]))):
         attempted = len(cms)
         solved_any = sum(1 for cm in cms if cm.successes > 0)
         macro = sum(cm.pass1 for cm in cms) / attempted if attempted else 0.0
@@ -213,9 +235,10 @@ def aggregate(trials: list[dict], ks: tuple = (1, 5, 10)) -> dict:
         pooled_succ = sum(cm.successes for cm in cms)
         micro = (pooled_succ / pooled_valid) if pooled_valid else 0.0
         model_aggs.append(ModelAgg(
-            model=model, cases_attempted=attempted, cases_solved_any=solved_any,
+            model=model, mode=mode, cases_attempted=attempted, cases_solved_any=solved_any,
             macro_pass1=macro, micro_pass1=micro, n_valid=pooled_valid,
-            n_error=sum(cm.n_error for cm in cms)))
+            n_error=sum(cm.n_error for cm in cms),
+            cost=_cost_means(pooled_valid_trials.get((model, mode), []))))
 
     return {"by_case_model": case_model, "by_model": model_aggs, "ks": list(ks)}
 

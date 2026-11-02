@@ -97,3 +97,21 @@ def test_bench_solver_error_is_error_trial(tmp_path, toycase):
     # error excluded from pass-rate denominator
     cm = R.aggregate(trials)["by_case_model"][0]
     assert cm.n_error == 1 and cm.n_valid == 0 and cm.pass1 == 0.0
+
+
+def patch_only_solver(bundle, model, work):
+    return None, (bundle / "fix.patch").read_bytes(), {
+        "solve_s": 1.0, "tokens": 1200, "usd_cost": 0.1, "llm_requests": 3}
+
+
+def test_bench_patch_only_mode_and_cost(tmp_path, toycase):
+    store = tmp_path / "t.jsonl"
+    e2e_bench.run_benchmark(
+        bundles=[toycase], models=["m"], n_trials=1, solver=patch_only_solver,
+        store=store, work_root=tmp_path / "w", timeout=180, mode="patch-only")
+    trials = R.load_trials(store)
+    assert trials[0]["mode"] == "patch-only" and trials[0]["verdict"] == "PASS"
+    assert trials[0]["poc_sha256"] is None  # no agent PoC in patch-only
+    assert trials[0]["tokens"] == 1200 and trials[0]["usd_cost"] == 0.1
+    bm = R.aggregate(trials, ks=(1,))["by_model"][0]
+    assert bm.mode == "patch-only" and bm.cost["tokens"] == 1200

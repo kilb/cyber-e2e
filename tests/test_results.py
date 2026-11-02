@@ -99,3 +99,28 @@ def test_load_trials_tolerates_torn_line(tmp_path):
         fh.write('{"case_id": "c", "verdict": "PA')  # torn final line (crash mid-write)
     trials = R.load_trials(store)
     assert len(trials) == 2 and [t["verdict"] for t in trials] == ["PASS", "FAIL"]
+
+
+def test_aggregate_splits_by_mode_and_averages_cost():
+    trials = [
+        {"case_id": "c", "model": "m", "mode": "e2e", "verdict": "PASS", "accepted": True,
+         "tokens": 1000, "usd_cost": 0.5, "solve_s": 10, "llm_requests": 3},
+        {"case_id": "c", "model": "m", "mode": "e2e", "verdict": "FAIL", "accepted": False,
+         "tokens": 2000, "usd_cost": 1.5, "solve_s": 20, "llm_requests": 5},
+        {"case_id": "c", "model": "m", "mode": "patch-only", "verdict": "PASS", "accepted": True,
+         "tokens": 500, "usd_cost": 0.25, "solve_s": 5},
+    ]
+    agg = R.aggregate(trials, ks=(1,))
+    pairs = {(x.model, x.mode) for x in agg["by_model"]}
+    assert ("m", "e2e") in pairs and ("m", "patch-only") in pairs
+    e2e = [x for x in agg["by_model"] if x.mode == "e2e"][0]
+    assert e2e.cost["tokens"] == 1500 and e2e.cost["usd_cost"] == 1.0 and e2e.cost["solve_s"] == 15
+    po = [x for x in agg["by_model"] if x.mode == "patch-only"][0]
+    assert po.cost["tokens"] == 500 and po.cost["llm_requests"] is None  # not provided
+    assert any(cm.mode == "patch-only" for cm in agg["by_case_model"])
+
+
+def test_aggregate_defaults_missing_mode_to_e2e():
+    trials = [{"case_id": "c", "model": "m", "verdict": "PASS", "accepted": True}]
+    agg = R.aggregate(trials)
+    assert agg["by_case_model"][0].mode == "e2e"

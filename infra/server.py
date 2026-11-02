@@ -148,10 +148,11 @@ def _public_view(case_id: str) -> dict[str, Any]:
     }
 
 
-def _zip_source_only(case_id: str) -> bytes:
-    """The agent download: ONLY repo/. Never build.yaml-with-answers, task.md,
-    fix.patch, or witness/. Memoized per case for the server's lifetime."""
-    cached = _zip_cache.get(case_id)
+def _zip_source(case_id: str, mode: str) -> bytes:
+    """The agent download. e2e: ONLY repo/ (never build.yaml, fix.patch, NOTES,
+    witness). patch-only: repo/ PLUS the reference PoC as poc.bin (the given input).
+    Memoized per (case, mode) for the server's lifetime."""
+    cached = _zip_cache.get((case_id, mode))
     if cached is not None:
         return cached
     bundle = _bundle_dir(case_id)
@@ -159,13 +160,17 @@ def _zip_source_only(case_id: str) -> bytes:
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
         for path in e2e_audit.served_source_files(bundle):
             zf.write(path, arcname=str(path.relative_to(bundle)))
+        if mode == "patch-only":
+            ref = _task.reference_poc_path(bundle)
+            if ref is not None:
+                zf.write(ref, arcname="poc.bin")
     data = buf.getvalue()
     with _zip_lock:
-        _zip_cache[case_id] = data
+        _zip_cache[(case_id, mode)] = data
     return data
 
 
-def _persist_result(job_id: str, case_id: str, result: dict | None, error: str | None) -> None:
+def _persist_result(job_id, case_id, mode, result, error) -> None:
     """Append a durable trial record for this submission if E2E_RESULTS is set.
     Best-effort: a store write failure must never fail the job."""
     if not RESULTS_STORE:
@@ -175,7 +180,7 @@ def _persist_result(job_id: str, case_id: str, result: dict | None, error: str |
     verdict = "ERROR" if error else ("PASS" if accepted else "FAIL")
     try:
         _results.append_trial(RESULTS_STORE, {
-            "case_id": case_id, "job_id": job_id, "source": "server",
+            "case_id": case_id, "job_id": job_id, "mode": mode, "source": "server",
             "verdict": verdict, "accepted": accepted,
             "reason": (result or {}).get("reason"),
             "rows": {k: detail.get(k) for k in _ROW_KEYS},
@@ -185,7 +190,7 @@ def _persist_result(job_id: str, case_id: str, result: dict | None, error: str |
         pass
 
 
-def _run_job(job_id: str, case_id: str, poc: bytes, patch: bytes) -> None:
+def _run_job(job_id: str, case_id: str, poc: bytes | None, patch: bytes, mode: str) -> None:
     with _jobs_lock:
         _jobs[job_id]["status"] = "running"
         _jobs[job_id]["started_at"] = time.time()
@@ -194,7 +199,7 @@ def _run_job(job_id: str, case_id: str, poc: bytes, patch: bytes) -> None:
     error = None
     try:
         bundle = CASES_ROOT / case_id
-        score = _task.score_repo_e2e(bundle, poc, patch, work, timeout=SCORE_TIMEOUT_SECONDS)
+        score = _task.score_repo_e2e(bundle, poc, patch, work, timeout=SCORE_TIMEOUT_SECONDS, mode=mode)
         result = asdict(score) if is_dataclass(score) else score
         with _jobs_lock:
             _jobs[job_id]["status"] = "done"
@@ -206,7 +211,7 @@ def _run_job(job_id: str, case_id: str, poc: bytes, patch: bytes) -> None:
             _jobs[job_id]["error"] = error
     finally:
         shutil.rmtree(work, ignore_errors=True)
-        _persist_result(job_id, case_id, result, error)
+        _persist_result(job_id, case_id, mode, result, error)
         with _jobs_lock:
             _jobs[job_id]["finished_at"] = time.time()
 
@@ -238,12 +243,20 @@ def get_case(case_id: str, x_api_key: str | None = Header(default=None)) -> dict
     return _public_view(case_id)
 
 
+def _require_mode(mode: str) -> str:
+    if mode not in _task.MODES:
+        raise HTTPException(status_code=400, detail=f"unknown mode {mode!r}; one of {list(_task.MODES)}")
+    return mode
+
+
 @app.get("/cases/{case_id}/source.zip")
-def download_source(case_id: str, x_api_key: str | None = Header(default=None)) -> Response:
+def download_source(case_id: str, mode: str = "e2e",
+                    x_api_key: str | None = Header(default=None)) -> Response:
     _require_api_key(x_api_key)
-    data = _zip_source_only(case_id)
+    _require_mode(mode)
+    data = _zip_source(case_id, mode)
     return Response(content=data, media_type="application/zip",
-                    headers={"Content-Disposition": f'attachment; filename="{case_id}-source.zip"'})
+                    headers={"Content-Disposition": f'attachment; filename="{case_id}-{mode}-source.zip"'})
 
 
 @app.post("/cases/{case_id}/submissions")
@@ -252,14 +265,20 @@ async def submit(case_id: str, request: Request,
     _require_api_key(x_api_key)
     _bundle_dir(case_id)
     form = await request.form()
-    poc_field = form.get("poc")
+    mode = _require_mode(str(form.get("mode") or "e2e"))
     patch_field = form.get("patch")
-    if poc_field is None or patch_field is None:
-        raise HTTPException(status_code=400, detail="submission requires both `poc` and `patch` fields")
-    poc = await poc_field.read() if hasattr(poc_field, "read") else str(poc_field).encode()
+    if patch_field is None:
+        raise HTTPException(status_code=400, detail="submission requires a `patch` field")
+    poc_field = form.get("poc")
+    # e2e requires a PoC; patch-only has none (the reference PoC is the given input).
+    if mode == "e2e" and poc_field is None:
+        raise HTTPException(status_code=400, detail="e2e submission requires a `poc` field")
+    poc = None
+    if poc_field is not None:
+        poc = await poc_field.read() if hasattr(poc_field, "read") else str(poc_field).encode()
+        if len(poc) > MAX_POC_BYTES:
+            raise HTTPException(status_code=413, detail=f"poc exceeds {MAX_POC_BYTES} bytes")
     patch = await patch_field.read() if hasattr(patch_field, "read") else str(patch_field).encode()
-    if len(poc) > MAX_POC_BYTES:
-        raise HTTPException(status_code=413, detail=f"poc exceeds {MAX_POC_BYTES} bytes")
     if len(patch) > MAX_PATCH_BYTES:
         raise HTTPException(status_code=413, detail=f"patch exceeds {MAX_PATCH_BYTES} bytes")
     _gc_old_jobs()
@@ -270,10 +289,10 @@ async def submit(case_id: str, request: Request,
     job_id = uuid.uuid4().hex
     with _jobs_lock:
         _jobs[job_id] = {
-            "job_id": job_id, "case_id": case_id, "status": "queued",
+            "job_id": job_id, "case_id": case_id, "mode": mode, "status": "queued",
             "created_at": time.time(), "result": None, "error": None,
         }
-    _executor.submit(_run_job, job_id, case_id, poc, patch)
+    _executor.submit(_run_job, job_id, case_id, poc, patch, mode)
     return {"job_id": job_id, "status": "queued"}
 
 

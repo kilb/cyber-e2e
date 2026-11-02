@@ -68,16 +68,21 @@ def _download_source(server: str, key: str, case_id: str, dest: Path) -> None:
     zpath.unlink()
 
 
-def _submit(server: str, key: str, case_id: str, poc: bytes, patch: bytes) -> str:
+def _submit(server: str, key: str, case_id: str, poc: bytes | None, patch: bytes,
+            *, mode: str = "e2e") -> str:
     import uuid
     boundary = uuid.uuid4().hex
     parts = []
-    for field, filename, payload in (("poc", "poc", poc), ("patch", "fix.patch", patch)):
+    # patch-only submits no poc (the reference PoC is the given input).
+    fields = [("patch", "fix.patch", patch), ("mode", None, mode.encode())]
+    if poc is not None:
+        fields.insert(0, ("poc", "poc", poc))
+    for field, filename, payload in fields:
         parts.append(f"--{boundary}\r\n".encode())
-        parts.append(
-            f'Content-Disposition: form-data; name="{field}"; filename="{filename}"\r\n'
-            f"Content-Type: application/octet-stream\r\n\r\n".encode()
-        )
+        disp = f'Content-Disposition: form-data; name="{field}"'
+        if filename:
+            disp += f'; filename="{filename}"'
+        parts.append((disp + "\r\nContent-Type: application/octet-stream\r\n\r\n").encode())
         parts.append(payload)
         parts.append(b"\r\n")
     parts.append(f"--{boundary}--\r\n".encode())
