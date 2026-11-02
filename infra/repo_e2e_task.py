@@ -366,6 +366,14 @@ class CaseContext:
         self.root = Path(root)
         self.root.mkdir(parents=True, exist_ok=True)
         self.timeout = timeout
+        try:
+            self._init(timeout)
+        except BaseException:
+            # A build/baseline failure mid-construction must not leak the work dir.
+            self.close()
+            raise
+
+    def _init(self, timeout: int) -> None:
         _require_scorable_bundle(self.bundle_dir)
         self._spec = load_spec(self.bundle_dir)
         # Context-level private TMPDIR for the one-time vulnerable build + baseline;

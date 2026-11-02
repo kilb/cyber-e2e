@@ -188,6 +188,28 @@ PID-only, shared FS/network — cannot provide). The trusted-orchestration use
   across a restart, by the restart-to-register discipline), so repeated agent
   downloads don't re-walk and re-deflate `repo/`.
 
+## Known limitations (deep-review, deferred by design)
+
+- **No overall per-submission deadline**: each scoring step has its own timeout,
+  but a pathological case could run many steps back-to-back. Bound total wall time
+  at the deployment layer (a job-level timeout) if needed.
+- **Untrusted-scoring isolation is a deployment responsibility** (see Trust model):
+  the harness isolates between jobs (fresh trees, per-job TMPDIR, agent sandbox)
+  but does not itself contain a malicious patch/PoC executing during build/run.
+- **Upload size is checked after buffering**: Starlette spools the multipart body
+  (to disk past ~1 MB) before the 413 check; put a body-size limit in the reverse
+  proxy for a hostile network. The 256 KB poc/patch caps still apply.
+- **The oracle owns the target's environment**: per-job TMPDIR covers the build,
+  tests, and the oracle process, but the target binary the oracle spawns gets
+  whatever env the oracle sets — oracle authors are responsible for the target's
+  env (e.g. ASAN_OPTIONS), as the contract already requires.
+
+These were verified by exercising the real paths end-to-end (e2e_local, the
+`cli_agent_solver` and HTTP-scorer bench paths, 6-way concurrent mixed
+submissions, and adversarial traversal/oversized inputs); none is a correctness
+bug, and the patch-traversal and solver-materialization guards are covered by
+`tests/test_deep.py`.
+
 ## Self-test case
 
 `tests/fixtures/toycase` is a fully-converted synthetic case (a planted
