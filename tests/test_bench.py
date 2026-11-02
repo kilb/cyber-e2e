@@ -2,6 +2,7 @@
 stack, exercised locally with injected solvers against the toy case."""
 import e2e_bench
 import e2e_results as R
+import repo_e2e_task as scorer
 
 SUBMITTED_POC = b"\x40\x00\x00\x00" + b"A" * 64
 
@@ -39,6 +40,40 @@ def test_bench_failures_recorded(tmp_path, toycase):
     trials = R.load_trials(store)
     assert all(t["verdict"] == "FAIL" for t in trials)
     assert all(t["rows"].get("patch_applies") is False for t in trials)
+
+
+def test_bench_cached_context(tmp_path, toycase):
+    store = tmp_path / "trials.jsonl"
+    seen = {}
+
+    def factory(bundle):
+        ctx = scorer.CaseContext(bundle, tmp_path / "cache" / bundle.name, timeout=180)
+        seen["ctx"] = ctx
+        return ctx
+
+    e2e_bench.run_benchmark(
+        bundles=[toycase], models=["fake-good"], n_trials=3,
+        solver=good_solver, store=store, work_root=tmp_path / "w",
+        context_factory=factory, timeout=180)
+    trials = R.load_trials(store)
+    assert len(trials) == 3 and all(t["verdict"] == "PASS" for t in trials)
+    # vulnerable tree built once for all three trials
+    assert seen["ctx"].vulnerable_build_count == 1
+
+
+def test_bench_broken_context_errors_all_trials(tmp_path, toycase):
+    store = tmp_path / "trials.jsonl"
+
+    def bad_factory(bundle):
+        raise RuntimeError("vulnerable build blew up")
+
+    e2e_bench.run_benchmark(
+        bundles=[toycase], models=["m"], n_trials=2,
+        solver=good_solver, store=store, work_root=tmp_path / "w",
+        context_factory=bad_factory, timeout=180)
+    trials = R.load_trials(store)
+    assert len(trials) == 2 and all(t["verdict"] == "ERROR" for t in trials)
+    assert all("context build failed" in t["error"] for t in trials)
 
 
 def test_bench_solver_error_is_error_trial(tmp_path, toycase):

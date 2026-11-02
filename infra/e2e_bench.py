@@ -64,38 +64,63 @@ def _make_record(case_id, model, trial, *, accepted, reason, detail, meta,
 
 
 def run_benchmark(*, bundles, models, n_trials, solver, store, work_root,
-                  scorer=inprocess_scorer, timeout=1800, on_trial=None) -> list[dict]:
+                  scorer=inprocess_scorer, context_factory=None,
+                  timeout=1800, on_trial=None) -> list[dict]:
+    """Run n_trials of each (case, model), persisting each trial as it completes.
+
+    If `context_factory(bundle) -> CaseContext` is given, the case's vulnerable
+    tree + row-3 baseline are built ONCE and reused across that case's trials
+    (big speedup for real builds); a context-build failure turns every trial of
+    that case into an ERROR trial rather than crashing the run. Otherwise each
+    trial is scored independently via `scorer`.
+    """
     store = Path(store)
     work_root = Path(work_root)
     records = []
     for bundle in bundles:
         bundle = Path(bundle)
         case_id = bundle.name
-        for model in models:
-            for trial in range(n_trials):
-                work = work_root / case_id / model / f"trial{trial}"
-                work.mkdir(parents=True, exist_ok=True)
-                poc = patch = None
-                try:
-                    poc, patch, meta = solver(bundle, model, work)
-                    t0 = time.time()
-                    res = scorer(bundle, poc, patch, work / "score", timeout)
-                    score_s = round(time.time() - t0, 2)
-                    rec = _make_record(
-                        case_id, model, trial,
-                        accepted=res.accepted, reason=res.reason, detail=res.detail,
-                        meta=meta, poc=poc, patch=patch, score_s=score_s,
-                        verdict="PASS" if res.accepted else "FAIL")
-                except Exception as exc:  # noqa: BLE001
-                    rec = _make_record(
-                        case_id, model, trial,
-                        accepted=None, reason="error", detail={}, meta=None,
-                        poc=poc, patch=patch, verdict="ERROR",
-                        error=f"{type(exc).__name__}: {exc}\n{traceback.format_exc()[-800:]}")
-                stored = R.append_trial(store, rec)
-                records.append(stored)
-                if on_trial:
-                    on_trial(stored)
+        ctx = None
+        ctx_err = None
+        if context_factory is not None:
+            try:
+                ctx = context_factory(bundle)
+            except Exception as exc:  # noqa: BLE001 -- broken case: every trial is ERROR
+                ctx_err = f"{type(exc).__name__}: {exc}"
+        try:
+            for model in models:
+                for trial in range(n_trials):
+                    work = work_root / case_id / model / f"trial{trial}"
+                    work.mkdir(parents=True, exist_ok=True)
+                    poc = patch = None
+                    try:
+                        if ctx_err:
+                            raise RuntimeError(f"case context build failed: {ctx_err}")
+                        poc, patch, meta = solver(bundle, model, work)
+                        t0 = time.time()
+                        if ctx is not None:
+                            res = ctx.score(poc, patch, work / "score", timeout=timeout)
+                        else:
+                            res = scorer(bundle, poc, patch, work / "score", timeout)
+                        score_s = round(time.time() - t0, 2)
+                        rec = _make_record(
+                            case_id, model, trial,
+                            accepted=res.accepted, reason=res.reason, detail=res.detail,
+                            meta=meta, poc=poc, patch=patch, score_s=score_s,
+                            verdict="PASS" if res.accepted else "FAIL")
+                    except Exception as exc:  # noqa: BLE001
+                        rec = _make_record(
+                            case_id, model, trial,
+                            accepted=None, reason="error", detail={}, meta=None,
+                            poc=poc, patch=patch, verdict="ERROR",
+                            error=f"{type(exc).__name__}: {exc}\n{traceback.format_exc()[-800:]}")
+                    stored = R.append_trial(store, rec)
+                    records.append(stored)
+                    if on_trial:
+                        on_trial(stored)
+        finally:
+            if ctx is not None:
+                ctx.close()
     return records
 
 
@@ -181,6 +206,9 @@ def main(argv: list) -> int:
     ap.add_argument("--sandbox", default=None, help="sandbox wrapper to prefix the agent command")
     ap.add_argument("--server", default=None, help="score via this server URL instead of in-process")
     ap.add_argument("--api-key", default=None)
+    ap.add_argument("--cache", action="store_true",
+                    help="in-process only: build each case's vulnerable tree + row-3 baseline "
+                         "once and reuse across its trials (CaseContext)")
     ap.add_argument("--report-md", default=None)
     ap.add_argument("--report-html", default=None)
     ap.add_argument("--ks", default="1,5,10")
@@ -198,11 +226,18 @@ def main(argv: list) -> int:
 
     solver = cli_agent_solver(args.agent, prompt=_DEFAULT_PROMPT,
                               budget=args.agent_budget, sandbox=args.sandbox)
+    context_factory = None
     if args.server:
         key = args.api_key or ""
         scorer = http_submit_scorer(args.server, key, poll_timeout=args.timeout + 600)
+        if args.cache:
+            print("note: --cache is ignored when scoring via --server", file=sys.stderr)
     else:
         scorer = inprocess_scorer
+        if args.cache:
+            cache_root = Path(args.work_root) / ".cache"
+            context_factory = lambda b: scorer_mod.CaseContext(  # noqa: E731
+                b, cache_root / b.name, timeout=args.timeout)
 
     def progress(rec):
         print(f"[{rec['verdict']:5s}] {rec['case_id']} / {rec['model']} "
@@ -210,7 +245,8 @@ def main(argv: list) -> int:
 
     run_benchmark(bundles=bundles, models=args.model, n_trials=args.trials,
                   solver=solver, store=args.store, work_root=args.work_root,
-                  scorer=scorer, timeout=args.timeout, on_trial=progress)
+                  scorer=scorer, context_factory=context_factory,
+                  timeout=args.timeout, on_trial=progress)
 
     ks = tuple(int(x) for x in args.ks.split(",") if x.strip())
     agg = R.aggregate(R.load_trials(args.store), ks=ks)
