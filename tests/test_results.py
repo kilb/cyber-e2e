@@ -89,3 +89,13 @@ def test_manifest_has_core_fields(tmp_path):
     import json
     on_disk = json.loads((tmp_path / "run.manifest.json").read_text())
     assert on_disk["python"] == man["python"]
+
+
+def test_load_trials_tolerates_torn_line(tmp_path):
+    store = tmp_path / "t.jsonl"
+    R.append_trial(store, {"case_id": "c", "verdict": "PASS"})
+    R.append_trial(store, {"case_id": "c", "verdict": "FAIL"})
+    with open(store, "a", encoding="utf-8") as fh:
+        fh.write('{"case_id": "c", "verdict": "PA')  # torn final line (crash mid-write)
+    trials = R.load_trials(store)
+    assert len(trials) == 2 and [t["verdict"] for t in trials] == ["PASS", "FAIL"]

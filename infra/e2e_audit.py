@@ -29,12 +29,25 @@ from pathlib import Path
 # Directories never included in the served payload (build artifacts, VCS).
 SERVED_EXCLUDE_DIRS = frozenset({".git", ".rrg-build", ".tmp"})
 
-# Answer artifacts that must never appear inside the served repo/ tree.
-_ANSWER_NAME_RE = re.compile(r"(e2e_probe|model_poc|narrow_|probe\.py|fix\.patch|NOTES\.md)", re.I)
+# Answer artifacts that must never appear inside the served repo/ tree. Matched by
+# EXACT basename / distinctive prefix (not substring), so ordinary source files
+# like `probe.py` or `narrow_window.c` are not wrongly flagged. These prefixes are
+# this harness's own artifact names and are vanishingly unlikely to collide with
+# real project source.
+_ANSWER_EXACT_NAMES = frozenset({"e2e_probe.py"})
+_ANSWER_NAME_PREFIXES = ("model_poc", "narrow_patch", "narrow_poc")
+# Names that MIGHT be an answer artifact but are plausible real source -> warning.
+_SUSPICIOUS_EXACT_NAMES = frozenset({"probe.py"})
 _ANSWER_PATH_PARTS = frozenset({"witness", ".git"})
 
 _CVE_RE = re.compile(rb"CVE-\d{4}-\d{3,}", re.I)
-_HASH_RE = re.compile(rb"\b[0-9a-f]{12,40}\b", re.I)
+# commit-ish hashes: 10-64 lowercase hex (covers git short/full and sha256). The
+# lower bound keeps short hex tokens from becoming noisy false secrets.
+_HASH_RE = re.compile(rb"\b[0-9a-f]{10,64}\b", re.I)
+
+
+def _is_answer_name(name: str) -> bool:
+    return name in _ANSWER_EXACT_NAMES or name.startswith(_ANSWER_NAME_PREFIXES)
 # Only scan plausibly-text files for secret tokens (cap per-file read size).
 _SCAN_MAX_BYTES = 1_000_000
 
@@ -114,15 +127,26 @@ def _readiness(bundle: Path) -> list[str]:
 
 
 def _secret_tokens(bundle: Path) -> set[bytes]:
-    """Case-specific identifiers that must never reach the agent: CVE ids and
-    commit-ish hashes declared in server-side NOTES.md / fix.patch filenames."""
+    """Case-specific identifiers that must never reach the agent, harvested from
+    the server-side (NOT served) material: CVE ids from every non-served file
+    (NOTES.md, fix.patch, build.yaml, witness/...), and commit-ish hashes from
+    NOTES.md only. Hashes are restricted to NOTES.md on purpose: a hex constant
+    could legitimately appear both in a fix.patch's context lines and in the
+    served vulnerable source, so harvesting hashes broadly would false-positive."""
+    served = set(served_source_files(bundle))
     tokens: set[bytes] = set()
-    notes = bundle / "NOTES.md"
-    if notes.is_file():
-        raw = notes.read_bytes()
+    for f in bundle.rglob("*"):
+        if not f.is_file() or f in served:
+            continue
+        if ".git" in f.relative_to(bundle).parts:
+            continue
+        try:
+            raw = f.read_bytes()[:_SCAN_MAX_BYTES]
+        except OSError:
+            continue
         tokens.update(m.group(0) for m in _CVE_RE.finditer(raw))
-        tokens.update(m.group(0) for m in _HASH_RE.finditer(raw))
-    # normalize to lowercase bytes for case-insensitive matching
+        if f.name == "NOTES.md":
+            tokens.update(m.group(0) for m in _HASH_RE.finditer(raw))
     return {t.lower() for t in tokens}
 
 
@@ -167,13 +191,16 @@ def audit_case(bundle: Path | str, *, scan_content: bool = True) -> AuditReport:
         rel = path.relative_to(bundle)
         if _ANSWER_PATH_PARTS & set(rel.parts):
             leaks.append(f"{rel}: served path includes a withheld directory")
-        if _ANSWER_NAME_RE.search(rel.name):
+        if _is_answer_name(rel.name):
             leaks.append(f"{rel}: served file looks like an answer artifact")
+        elif rel.name in _SUSPICIOUS_EXACT_NAMES:
+            warnings.append(f"{rel}: served file name resembles an answer artifact (review)")
 
     # (2) case-specific secrets / stray CVEs in served content (expensive: reads files)
     if scan_content:
-        content_leaks, warnings = _scan_content(served, bundle)
+        content_leaks, content_warnings = _scan_content(served, bundle)
         leaks.extend(content_leaks)
+        warnings.extend(content_warnings)
 
     reasons = _readiness(bundle)
     served_bytes = sum(p.stat().st_size for p in served)

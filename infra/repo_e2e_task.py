@@ -297,11 +297,19 @@ class CaseContext:
         if not ok:
             raise RuntimeError(f"vulnerable tree failed to build (infra): {log}")
 
+        # Establish the row-3 baseline on a DISPOSABLE COPY so self.vulnerable is
+        # only ever `build`-run, never `public_tests`-run, before it is observed
+        # for row 1. This matches the fresh path (which observes row 1 before its
+        # baseline runs) even for a test recipe that mutates the build tree, so
+        # --cache scoring cannot diverge from server scoring.
         self.baseline_checked_count = 0
         self.baseline_ok, self.baseline_log = True, ""
         if _declared_public_tests(self.bundle_dir):
+            base_tree = self.root / "baseline"
+            shutil.copytree(self.vulnerable, base_tree)
             self.baseline_ok, self.baseline_log = _run_public_tests(
-                self.bundle_dir, self.vulnerable, timeout=timeout)
+                self.bundle_dir, base_tree, timeout=timeout)
+            shutil.rmtree(base_tree, ignore_errors=True)
             self.baseline_checked_count = 1
             if not self.baseline_ok:
                 raise RuntimeError(

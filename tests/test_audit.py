@@ -101,3 +101,48 @@ def test_scan_content_false_skips_content_but_keeps_structural(tmp_path, toycase
     shutil.copytree(toycase, bad2)
     shutil.copy(bad2 / "witness" / "e2e_probe.py", bad2 / "repo" / "e2e_probe.py")
     assert not e2e_audit.audit_case(bad2, scan_content=False).ok
+
+
+# ---- review-finding regressions ----
+
+def test_ordinary_source_names_not_flagged(tmp_path, toycase):
+    import shutil
+    good = tmp_path / "g"
+    shutil.copytree(toycase, good)
+    (good / "repo" / "narrow_window.c").write_text("int x;\n", encoding="utf-8")  # not narrow_patch/poc
+    (good / "repo" / "probe.py").write_text("print('hi')\n", encoding="utf-8")    # suspicious -> warning
+    rep = e2e_audit.audit_case(good)
+    assert rep.ok, rep.leaks
+    assert any("probe.py" in w for w in rep.warnings), rep.warnings
+
+
+def test_model_poc_prefix_still_flagged(tmp_path, toycase):
+    import shutil
+    bad = tmp_path / "b"
+    shutil.copytree(toycase, bad)
+    (bad / "repo" / "model_poc_helper.py").write_text("x\n", encoding="utf-8")
+    assert not e2e_audit.audit_case(bad).ok
+
+
+def test_sha256_commit_leak_detected(tmp_path, toycase):
+    import shutil
+    bad = tmp_path / "b256"
+    shutil.copytree(toycase, bad)
+    h = "a" * 64  # 64-char sha256-style hash
+    (bad / "NOTES.md").write_text(f"fix commit: {h}\n", encoding="utf-8")
+    (bad / "repo" / "VERSION").write_text(f"built from {h}\n", encoding="utf-8")
+    rep = e2e_audit.audit_case(bad)
+    assert not rep.ok and any(h in leak for leak in rep.leaks), rep.leaks
+
+
+def test_cve_declared_in_buildyaml_is_leak(tmp_path, toycase):
+    import shutil
+    bad = tmp_path / "bby"
+    shutil.copytree(toycase, bad)
+    # CVE declared server-side but NOT in NOTES.md (here: in build.yaml) ...
+    (bad / "build.yaml").write_text(
+        (bad / "build.yaml").read_text() + "\n# addresses CVE-2026-77777\n", encoding="utf-8")
+    # ... and it leaks into served source -> hard leak (finding 5).
+    (bad / "repo" / "doc.txt").write_text("see CVE-2026-77777\n", encoding="utf-8")
+    rep = e2e_audit.audit_case(bad)
+    assert not rep.ok and any("CVE-2026-77777" in leak for leak in rep.leaks), rep.leaks

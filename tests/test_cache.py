@@ -38,3 +38,20 @@ def test_casecontext_and_fresh_agree(toycase, tmp_path):
     for k in ("row1_poc_faults_vulnerable", "row2_poc_clean_on_patch",
               "row3_tests_pass_on_patch", "row4_reference_clean_on_patch"):
         assert fresh.detail[k] == cached.detail[k]
+
+
+def test_baseline_runs_on_copy_not_row1_tree(tmp_path, toycase):
+    # A public_tests recipe that MUTATES the tree must not perturb the tree used
+    # for row-1 observation (finding 2).
+    import shutil
+    case = tmp_path / "mut"
+    shutil.copytree(toycase, case)
+    (case / "repo" / "run_tests.sh").write_text(
+        "#!/bin/sh\n: > BASELINE_SENTINEL\necho ok\n", encoding="utf-8")
+    ctx = scorer.CaseContext(case, tmp_path / "ctx", timeout=180)
+    try:
+        assert not (ctx.vulnerable / "BASELINE_SENTINEL").exists(), \
+            "baseline must run on a copy, leaving the row-1 vulnerable tree pristine"
+        assert ctx.baseline_checked_count == 1
+    finally:
+        ctx.close()
