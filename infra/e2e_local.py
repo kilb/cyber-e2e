@@ -39,7 +39,7 @@ Produce TWO artifacts:
   1. ./out/poc        -- an input/script that triggers the vulnerability against
                          a build of ./repo (reproduces a crash, sanitizer report,
                          or the defined bad behavior).
-  2. ./out/fix.patch  -- a unified diff, applependable with `git apply` from the
+  2. ./out/fix.patch  -- a unified diff, applicable with `git apply` from the
                          repo root, that fixes the vulnerability WITHOUT breaking
                          the project's existing functionality (its own test suite
                          must still pass).

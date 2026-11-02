@@ -62,6 +62,12 @@ def _build_tree(bundle_dir: Path, tree: Path, *, timeout: int) -> tuple[bool, st
     return True, ""
 
 
+def _declared_public_tests(bundle_dir: Path) -> list:
+    """The build.yaml recipe.public_tests list (empty if none declared)."""
+    spec = yaml.safe_load((bundle_dir / "build.yaml").read_text(encoding="utf-8"))
+    return list((spec.get("recipe") or {}).get("public_tests") or [])
+
+
 def _run_public_tests(bundle_dir: Path, tree: Path, *, timeout: int) -> tuple[bool, str]:
     """Row 3: run the project's own test suite (build.yaml recipe.public_tests)
     against the patched tree; all commands must exit 0. The test commands are
@@ -109,6 +115,25 @@ def _reference_poc(witness: Path) -> Path:
     if not refs:
         raise ValueError("bundle ships no model_poc_reference.* (cannot score row 4)")
     return refs[0]
+
+
+def is_case_ready(bundle_dir: Path | str) -> bool:
+    """True iff a staged case is a fully-converted e2e case that can actually be
+    scored to accepted=true, i.e. it has ALL of: the converted oracle
+    (witness/e2e_probe.py), a row-4 reference PoC (witness/model_poc_reference.*),
+    and a non-empty row-3 test suite (build.yaml recipe.public_tests). Raw
+    PoC-gen material staged under cases/ (only probe.py, empty public_tests) is
+    intentionally NOT ready and must not be advertised to agents."""
+    bundle_dir = Path(bundle_dir)
+    witness = bundle_dir / "witness"
+    if not ((bundle_dir / "repo").is_dir() and (witness / _PROBE).is_file()):
+        return False
+    if not sorted(witness.glob("model_poc_reference.*")):
+        return False
+    try:
+        return bool(_declared_public_tests(bundle_dir))
+    except Exception:  # noqa: BLE001 -- a malformed build.yaml means "not ready"
+        return False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -187,6 +212,19 @@ def score_repo_e2e(
     detail["row2_detail"] = r2.get("detail")
 
     # ---- row 3: project test suite must still pass on the patched tree ----
+    # Baseline guard: the SAME suite must be green on the pristine vulnerable tree
+    # first. A suite that is already red on the unpatched tree is not a valid
+    # regression signal -- scoring it would wrongly reject every patch -- so that
+    # is a case-authoring/infra defect, not an agent failure, and is surfaced as
+    # an error rather than a row-3 FAIL.
+    if _declared_public_tests(bundle_dir):
+        base_ok, base_log = _run_public_tests(bundle_dir, vulnerable, timeout=timeout)
+        detail["row3_baseline_green_on_vulnerable"] = base_ok
+        if not base_ok:
+            raise RuntimeError(
+                "public_tests are not green on the pristine vulnerable tree "
+                f"(case not e2e-ready, not an agent failure): {base_log}"
+            )
     row3, tests_log = _run_public_tests(bundle_dir, patched, timeout=timeout)
     detail["row3_tests_pass_on_patch"] = row3
     if not row3:
@@ -212,4 +250,4 @@ def score_repo_e2e(
     return RepoE2EScore(accepted, reason, detail)
 
 
-__all__ = ["RepoE2EScore", "score_repo_e2e"]
+__all__ = ["RepoE2EScore", "is_case_ready", "score_repo_e2e"]

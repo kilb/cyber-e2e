@@ -44,14 +44,18 @@ _spec.loader.exec_module(_task)
 
 
 def _discover_cases() -> tuple[str, ...]:
-    """A case is any immediate subdir of CASES_ROOT holding repo/ + witness/.
-    Discovered fresh at import time; restart the server after adding a case
-    (same restart-to-register discipline as the sibling project)."""
+    """Advertise only FULLY-CONVERTED e2e cases: a subdir of CASES_ROOT is listed
+    only when `is_case_ready` holds (repo/ + witness/e2e_probe.py + a row-4
+    reference PoC + a non-empty row-3 test suite). Raw PoC-gen material staged
+    under cases/ (only probe.py, no public_tests) is deliberately skipped, so the
+    server never hands an agent a case that can never be scored to accepted=true.
+    Discovered fresh at import time; restart the server after a case becomes
+    ready (same restart-to-register discipline as the sibling project)."""
     if not CASES_ROOT.is_dir():
         return ()
     found = []
     for child in sorted(CASES_ROOT.iterdir()):
-        if (child / "repo").is_dir() and (child / "witness").is_dir():
+        if child.is_dir() and _task.is_case_ready(child):
             found.append(child.name)
     return tuple(found)
 
