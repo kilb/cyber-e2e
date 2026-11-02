@@ -85,3 +85,19 @@ def test_case_fingerprint_stable_and_sensitive(tmp_path, toycase):
     shutil.copytree(toycase, copy2)
     (copy2 / "fix.patch").write_text("irrelevant\n", encoding="utf-8")
     assert e2e_audit.case_fingerprint(copy2) == fp1
+
+
+def test_scan_content_false_skips_content_but_keeps_structural(tmp_path, toycase):
+    # content leak (declared CVE in served file) is MISSED without a content scan ...
+    bad = tmp_path / "c"
+    import shutil
+    shutil.copytree(toycase, bad)
+    (bad / "NOTES.md").write_text("CVE-2026-109618\n", encoding="utf-8")
+    (bad / "repo" / "CHANGELOG").write_text("CVE-2026-109618\n", encoding="utf-8")
+    assert e2e_audit.audit_case(bad, scan_content=False).ok          # cheap gate passes
+    assert not e2e_audit.audit_case(bad, scan_content=True).ok       # full gate catches it
+    # ... but an answer artifact physically in repo/ is caught either way (structural)
+    bad2 = tmp_path / "c2"
+    shutil.copytree(toycase, bad2)
+    shutil.copy(bad2 / "witness" / "e2e_probe.py", bad2 / "repo" / "e2e_probe.py")
+    assert not e2e_audit.audit_case(bad2, scan_content=False).ok

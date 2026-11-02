@@ -150,12 +150,19 @@ def _scan_content(served: list[Path], bundle: Path) -> tuple[list[str], list[str
     return leaks, warnings
 
 
-def audit_case(bundle: Path | str) -> AuditReport:
+def audit_case(bundle: Path | str, *, scan_content: bool = True) -> AuditReport:
+    """Audit one case. `scan_content=True` (default) reads every served file to
+    catch case-secret / stray-CVE content leaks -- the thorough pre-flight gate
+    run by the CLI and certification. `scan_content=False` does only the cheap
+    structural checks (readiness + answer-artifact paths/names) and is what the
+    server uses at discovery, so startup does not read every file of every large
+    repo on each restart. Going live requires a full (scan_content=True) audit."""
     bundle = Path(bundle)
     served = served_source_files(bundle)
     leaks: list[str] = []
+    warnings: list[str] = []
 
-    # (1) answer artifacts served to the agent
+    # (1) answer artifacts served to the agent (cheap: path/name only)
     for path in served:
         rel = path.relative_to(bundle)
         if _ANSWER_PATH_PARTS & set(rel.parts):
@@ -163,9 +170,10 @@ def audit_case(bundle: Path | str) -> AuditReport:
         if _ANSWER_NAME_RE.search(rel.name):
             leaks.append(f"{rel}: served file looks like an answer artifact")
 
-    # (2) case-specific secrets / stray CVEs in served content
-    content_leaks, warnings = _scan_content(served, bundle)
-    leaks.extend(content_leaks)
+    # (2) case-specific secrets / stray CVEs in served content (expensive: reads files)
+    if scan_content:
+        content_leaks, warnings = _scan_content(served, bundle)
+        leaks.extend(content_leaks)
 
     reasons = _readiness(bundle)
     served_bytes = sum(p.stat().st_size for p in served)

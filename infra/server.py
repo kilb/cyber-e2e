@@ -62,7 +62,11 @@ def _discover_cases() -> tuple[str, ...]:
         return ()
     found = []
     for child in sorted(CASES_ROOT.iterdir()):
-        if child.is_dir() and e2e_audit.audit_case(child).ok:
+        # Cheap structural gate at startup (readiness + no answer artifacts in
+        # repo/). The full content leak scan is a pre-flight step run via
+        # e2e_audit.py / e2e_certify.py before a case goes live, not on every
+        # restart (reading every file of every large repo would be slow).
+        if child.is_dir() and e2e_audit.audit_case(child, scan_content=False).ok:
             found.append(child.name)
     return tuple(found)
 
