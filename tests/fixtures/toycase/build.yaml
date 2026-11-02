@@ -1,0 +1,17 @@
+lock_id: toycase-synthetic-selftest-build
+system_packages: [bash, gcc, make]
+environment:
+  LC_ALL: C.UTF-8
+  PYTHONDONTWRITEBYTECODE: "1"
+locale: C.UTF-8
+timezone: UTC
+network_policy: deny
+network_allowlist: []
+recipe:
+  configure: []
+  build:
+    - sh build.sh
+  public_tests:
+    - sh run_tests.sh
+artifact_paths:
+  - .rrg-build/bin/prog

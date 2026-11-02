@@ -1,0 +1,12 @@
+diff --git a/prog.c b/prog.c
+index 0f6f040..3a0e7b5 100644
+--- a/prog.c
++++ b/prog.c
+@@ -24,6 +24,7 @@ static int process(const unsigned char *data, size_t data_len) {
+     const unsigned char *payload = data + 4;
+     size_t avail = data_len - 4;
+     if (len > avail) len = (unsigned)avail;   /* clamp to input size only -- BUG */
++    if (len > sizeof(buf)) len = (unsigned)sizeof(buf);  /* FIX: clamp to buffer size */
+     memcpy(buf, payload, len);                /* overflow when len > sizeof(buf) */
+     int sum = 0;
+     for (unsigned i = 0; i < len; i++) sum += (unsigned char)buf[i];

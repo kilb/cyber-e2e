@@ -37,25 +37,32 @@ CASES_ROOT = Path(os.environ.get("E2E_CASES_ROOT", str(ROOT.parent / "cases")))
 WORK_ROOT = ROOT / "work"
 WORK_ROOT.mkdir(parents=True, exist_ok=True)
 
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
 _spec = importlib.util.spec_from_file_location("e2e_repo_task", ROOT / "repo_e2e_task.py")
 _task = importlib.util.module_from_spec(_spec)
 sys.modules[_spec.name] = _task
 _spec.loader.exec_module(_task)
 
+import e2e_audit  # noqa: E402 -- shares the served-payload selection + leak audit
+
 
 def _discover_cases() -> tuple[str, ...]:
-    """Advertise only FULLY-CONVERTED e2e cases: a subdir of CASES_ROOT is listed
-    only when `is_case_ready` holds (repo/ + witness/e2e_probe.py + a row-4
-    reference PoC + a non-empty row-3 test suite). Raw PoC-gen material staged
-    under cases/ (only probe.py, no public_tests) is deliberately skipped, so the
-    server never hands an agent a case that can never be scored to accepted=true.
-    Discovered fresh at import time; restart the server after a case becomes
-    ready (same restart-to-register discipline as the sibling project)."""
+    """Advertise only FULLY-CONVERTED, LEAK-FREE e2e cases. A subdir of
+    CASES_ROOT is listed only when `e2e_audit.audit_case(...).ok` holds, i.e. it
+    is both e2e-ready (repo/ + witness/e2e_probe.py + a row-4 reference PoC + a
+    non-empty row-3 test suite) AND leak-free (nothing in the served repo/ tree
+    fingerprints the vulnerability or ships an answer artifact). Raw PoC-gen
+    material (only probe.py, no public_tests) and any case that would leak its
+    answer to the agent are deliberately skipped. Discovered fresh at import
+    time; restart the server after a case becomes ready (same restart-to-register
+    discipline as the sibling project)."""
     if not CASES_ROOT.is_dir():
         return ()
     found = []
     for child in sorted(CASES_ROOT.iterdir()):
-        if child.is_dir() and _task.is_case_ready(child):
+        if child.is_dir() and e2e_audit.audit_case(child).ok:
             found.append(child.name)
     return tuple(found)
 
@@ -131,9 +138,8 @@ def _zip_source_only(case_id: str) -> bytes:
     bundle = _bundle_dir(case_id)
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-        for path in sorted((bundle / "repo").rglob("*")):
-            if path.is_file() and ".rrg-build" not in path.parts and ".git" not in path.parts:
-                zf.write(path, arcname=str(Path("repo") / path.relative_to(bundle / "repo")))
+        for path in e2e_audit.served_source_files(bundle):
+            zf.write(path, arcname=str(path.relative_to(bundle)))
     return buf.getvalue()
 
 
