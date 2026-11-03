@@ -29,6 +29,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import e2e_audit  # noqa: E402 -- leak/readiness pre-flight, now a required control
 import repo_e2e_task as scorer  # noqa: E402
 
 # A patch that applies and builds everywhere but changes no program logic.
@@ -96,12 +97,28 @@ def certify_case(bundle: Path | str, work_root: Path | str, *, timeout: int = 18
     bundle = Path(bundle)
     work_root = Path(work_root)
     work_root.mkdir(parents=True, exist_ok=True)
+
+    # Leak/readiness pre-flight is now a REQUIRED certify control, not a step an
+    # operator has to remember to run separately. A real leak was previously
+    # certified clean this way: strongswan-create-child-sa-unestablished-race-001
+    # had its own CVE id and full vulnerability mechanism spelled out in a
+    # repo/build.sh comment -- `score_repo_e2e`'s 4-row check has no way to
+    # notice that (it only grades PoC/patch behavior), so the case certified
+    # fine while actively leaking the answer to anything served from it. A case
+    # that fails this can never be `certified`, full stop, regardless of how
+    # the scoring controls below come out.
+    audit = e2e_audit.audit_case(bundle)
+    controls = [ControlResult(
+        "audit", True, audit.ok, audit.ok,
+        "clean" if audit.ok else "; ".join(audit.reasons + audit.leaks),
+        {"reasons": audit.reasons, "leaks": audit.leaks, "warnings": audit.warnings})]
+
     ref = _reference_poc_bytes(bundle)
     if ref is None:
-        return CertifyReport(bundle.name, [ControlResult(
-            "setup", True, None, False, "no witness/model_poc_reference.* to certify with", {})])
+        controls.append(ControlResult(
+            "setup", True, None, False, "no witness/model_poc_reference.* to certify with", {}))
+        return CertifyReport(bundle.name, controls)
 
-    controls = []
     fixp = bundle / "fix.patch"
     if fixp.is_file():
         controls.append(_run_control(

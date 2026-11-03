@@ -146,6 +146,16 @@ than simpler parser/bounds cases (see the time-budget guidance in the
   compilation; green on vuln + patched.
 - `e2e_certify` (real scorer, run **independently by Claude**, not just the
   GLM worker's self-report): accepted + no-op both pass → **CERTIFIED**.
+- **Leak found and fixed post-certification**: `e2e_audit.py` (run separately,
+  after the fact) caught `repo/build.sh` -- a SERVED file -- containing a
+  comment that named this case's own CVE id and spelled out the full
+  vulnerability mechanism/precondition. `score_repo_e2e`'s 4-row check only
+  grades PoC/patch behavior, so it had no way to notice; the case certified
+  clean while actively leaking the answer. Redacted the comment to pure build
+  rationale (no CVE/mechanism/precondition language), re-audited `[OK]`,
+  re-certified CERTIFIED. `e2e_certify.py` now runs the leak/readiness audit
+  as a REQUIRED first control (see its own changelog) so this can't recur
+  silently for any case.
 
 ### Note: an archived, independently-authored reference PoC already existed
 
@@ -185,6 +195,19 @@ Each framework fix has a regression test in `tests/test_scorer_toycase.py`.
 **Hygiene rule (applies to the remaining cases):** prefer a pristine `repo/`;
 compile row-3 tests fresh rather than trusting stale objects/mtimes.
 
+## Full 20-case audit snapshot (`e2e_audit.py`, 2026-11-03)
+
+| status | count | cases |
+|---|---|---|
+| `[OK]` -- ready + leak-free | **5** | gnutls, msquic, ngtcp2, pjsip, strongswan (all 5 batch-2 cases) |
+| `[LEAK]` -- blocks readiness | 3 | asyncssh-terrapin-prefix-truncation-001, bind9-sig0-validation-race-001, mosquitto-packet-sequence-heap-uaf-001 (not yet investigated -- part of the untouched 15, flagging so the next conversion pass knows to check these specifically before relying on their raw material) |
+| `[RAW]` -- not yet converted | 12 | frr-bgp-flowspec-operator-bounds-offbyone, frr-ospf-te-sr-tlv-length-integer-overflow, mbedtls-dtls-badmac-renegotiation-state-confusion, net-snmp-trapd-enterprise-oid-array-oob-write, openssh-client-rekey-hostkey-change-uaf, php-fpm-worker-stale-state-reuse-uaf, php-oom-bailout-request-state-uaf, powerdns-recursor-dnssec-wildcard-cache-confusion, strongswan-libtls-untrusted-cert-key-crash, wolfssl-pathbuild-tempca-keyusage-bypass, wolfssl-session-resumption-sni-alpn-bind-bypass, wolfssl-tls13-posthandshake-auth-bypass |
+
+Only the 5 `[OK]` cases are servable today. `blk.so:~/rrg-e2e/infra/` is a
+manually-`rsync`'d copy, NOT a git checkout -- it does not auto-update from
+this repo's commits; re-sync before relying on it for a run or a conversion
+pass.
+
 ## Next actions
 
 1. ✅ pjsip, ✅ msquic, ✅ gnutls, ✅ ngtcp2, ✅ strongswan CERTIFIED — **5/5**.
@@ -194,6 +217,11 @@ compile row-3 tests fresh rather than trusting stale objects/mtimes.
 3. clean isolated benchmark re-run (the first run's msquic/gnutls ERRORs were
    resource contention from running concurrently with the GLM builds, not
    case/framework defects) — now that the box is no longer running any GLM
-   case-authoring, a clean run is unblocked.
+   case-authoring, a clean run is unblocked. NB: the box also runs several
+   unrelated always-on heavy tenants (blockchain full nodes: geth/reth/zebra/
+   lighthouse) -- load average ~3.5-4.8 is a baseline floor, not something
+   that fully clears even when our own/the sibling's jobs are idle.
 4. Remaining 15 cases (of 20) still raw PoC-gen material -- next conversion
    batch, same split (Claude: oracle + row-3 + certify; GLM: reference PoC).
+   Check the 3 `[LEAK]` cases above first; a leak in raw material likely
+   means the leak needs fixing during conversion, not that the case is unusable.
