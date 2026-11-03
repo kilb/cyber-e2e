@@ -14,7 +14,7 @@ GLM worker (`glm-5.3-prime`) authors the triggering `witness/model_poc_reference
 | 2 | msquic-connection-migration-path-promotion-uaf | QUIC | UAF | YES (`.c`) | not started |
 | 3 | ngtcp2-qlog-transport-params-stack-overflow | QUIC | stack overflow | NO | harness **ready**; controls reject correctly; reference PoC is `PENDING_EXTERNAL` → GLM to author (client must establish version-negotiation state first — see its NOTES) |
 | 4 | gnutls-dtls-fragment-length-confusion | DTLS | length confusion | YES (`.c`) | not started |
-| 5 | pjsip-ice-session-teardown-callback-uaf | ICE/STUN | teardown-race UAF | YES (`.py`) | **oracle converted + proven on real builds** (see below); needs `public_tests` + full certify |
+| 5 | pjsip-ice-session-teardown-callback-uaf | ICE/STUN | teardown-race UAF | YES (`.py`) | ✅ **CERTIFIED** — full 4-row loop proven via the real scorer (see below) |
 
 ## Harness shape (common to these library cases)
 
@@ -29,16 +29,44 @@ pins specificity (frame match is diagnostic detail).
 
 ## Progress
 
-### pjsip (case 5) — oracle done + proven
+### pjsip (case 5) — ✅ CERTIFIED (first case; the 4-row loop is proven)
 - `witness/e2e_probe.py` authored (adapts `probe.py` to the e2e `observe`
-  contract; observe-only). Deployed on blk.so.
-- Verified on real ASan builds (~22 s each):
-  - reference PoC on **vulnerable** tree → `faulted:true` (ASan UAF in
-    `ice_session.c`, exit 86).
-  - benign negative on vulnerable tree → `faulted:false` (no false positive).
-  - reference PoC on **patched** (clean-rebuilt) tree → `faulted:false`, exit 0.
-- Remaining: author `recipe.public_tests` (pjnath regression suite subset for
-  row 3), then run full `e2e_certify` (accepted / no-op / narrow).
+  contract; observe-only). Verified on real ASan builds: reference PoC faults the
+  vulnerable tree (ASan UAF in `ice_session.c`, exit 86), clean on the patched
+  tree, benign negative clean.
+- `recipe.public_tests` (row 3) = a faithful fast subset of pjproject's own
+  `pjnath-test`: `stun_test` + `sess_auth_test` (~9 s). The slow ICE delay-matrix
+  and network-flaky STUN/TURN socket suites are dropped, and `concur_test` is
+  dropped (it intermittently deadlocks under ASan). ICE-teardown-specific
+  correctness is enforced by rows 2/4 (the reference PoC drives a full ICE session
+  and must stay clean on the patched tree).
+- `e2e_certify` (real scorer): **accepted** control (reference PoC + `fix.patch`)
+  → accepted=true (all 4 rows); **no-op** control → correctly rejected. CERTIFIED.
+  (No `narrow` control shipped for this case, so that optional check is skipped.)
+- **Open row-3 strengthening**: a bounded ICE-lifecycle check would also catch an
+  ICE-*disabling* degenerate patch (which stun/auth alone wouldn't). Deferred,
+  documented; rows 2/4 already cover the common teardown-break case.
+
+## Two "stale artifact" bugs found + fixed during this conversion
+
+Both are the same hazard — a staged `repo/` is NOT pristine (the sibling built
+in-tree), so builds silently reuse stale artifacts — at two layers:
+
+1. **Scorer `.rrg-build` copy** (framework, fixed in `repo_e2e_task._copy_source`,
+   already on `main`): the scorer copied `repo/` wholesale incl. a pre-built
+   `.rrg-build`; an idempotent `build.sh` then skipped recompiling the patched
+   tree → every patch wrongly rejected. Now build trees exclude
+   `_ARTIFACT_DIRS` (`.git`/`.rrg-build`/`.tmp`).
+2. **Row-3 header-dep staleness** (per-case, in the pjsip `public_tests`): `make`'s
+   header-dependency tracking does not survive the tree copy, so editing `test.h`
+   to select test suites did NOT recompile `test.o` — the row-3 binary kept running
+   the full slow `ice_test` → 150 s timeout → "baseline not green". Fix: the row-3
+   command force-rebuilds the test (`rm -rf pjnath/build/output/pjnath-test-*
+   pjnath/bin/pjnath-test-*`) before `make`, guaranteeing the selection compiles in.
+
+**Hygiene rule for conversion (applies to the other 4 cases too):** prefer a
+pristine `repo/` (no in-tree build outputs); where a row-3 selection depends on a
+header edit, force-rebuild the affected objects rather than trusting mtimes.
 
 ## Framework bug found + fixed during this work
 
@@ -54,9 +82,10 @@ rebuilt from pristine source. Regression test in `tests/test_scorer_toycase.py`.
 
 ## Next actions
 
-1. pjsip: author `public_tests` → full `e2e_certify` (prove the whole 4-row loop
-   on a hard protocol case).
-2. Dispatch GLM for the ngtcp2 reference PoC (harness ready).
-3. msquic + gnutls: author `e2e_probe.py` (ref PoCs already present) + `public_tests`.
+1. ✅ pjsip CERTIFIED — the whole 4-row loop is proven on a hard protocol case.
+2. msquic + gnutls: author `e2e_probe.py` (ref PoCs already present) + `public_tests`
+   (apply the pristine/force-rebuild hygiene from the start).
+3. Dispatch GLM for the ngtcp2 reference PoC (harness ready).
 4. strongswan: finish the observe-side harness wiring (observer→charon) before a
    PoC is feasible — the heaviest case.
+5. (optional) strengthen pjsip row-3 with a bounded ICE-lifecycle check.
