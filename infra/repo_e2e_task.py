@@ -36,6 +36,19 @@ import e2e_exec  # noqa: E402 -- host/docker execution backends
 
 _PROBE = "e2e_probe.py"  # per-case oracle, authored by the GLM worker
 
+# Build-artifact / VCS dirs never copied into a build tree. A staged repo/ may ship
+# a pre-built .rrg-build; copying it in would let an idempotent build.sh (`exit 0 if
+# binary exists`) SKIP recompiling the patched tree, so every patch would silently
+# run the stale vulnerable binary and every submission be wrongly rejected. Build
+# trees must always be rebuilt from pristine source. (Same set the served payload
+# excludes; e2e_audit.SERVED_EXCLUDE_DIRS reuses this as the single definition.)
+_ARTIFACT_DIRS = frozenset({".git", ".rrg-build", ".tmp"})
+
+
+def _copy_source(src: Path, dst: Path) -> None:
+    """Copy a pristine source tree, excluding build-artifact/VCS dirs (_ARTIFACT_DIRS)."""
+    shutil.copytree(src, dst, ignore=shutil.ignore_patterns(*_ARTIFACT_DIRS))
+
 
 def _git_apply(tree: Path, patch_path: Path) -> tuple[bool, str]:
     """Apply a patch to a tree with `git apply`. Returns (ok, stderr). Used both
@@ -232,7 +245,7 @@ def _build_vulnerable_tree(bundle_dir: Path, dest: Path, *, timeout: int, spec: 
                            extra_env: dict | None = None, backend=None) -> None:
     """Copy repo/ to `dest` and run the build recipe; a failure here is an infra
     error (the pristine vulnerable tree must build). Shared by both entry points."""
-    shutil.copytree(Path(bundle_dir) / "repo", dest)
+    _copy_source(Path(bundle_dir) / "repo", dest)
     ok, log = _build_tree(bundle_dir, dest, timeout=timeout, spec=spec, extra_env=extra_env, backend=backend)
     if not ok:
         raise RuntimeError(f"vulnerable tree failed to build (infra): {log}")
@@ -302,7 +315,7 @@ def _score_core(bundle_dir: Path, vulnerable_built: Path, poc: bytes | None, pat
     detail: dict[str, object] = {"schema": "cybergym-e2e.score/v1", "mode": mode}
 
     patched = work / "patched"
-    shutil.copytree(repo, patched)
+    _copy_source(repo, patched)
     applied, apply_err = _git_apply(patched, patch_path)
     detail["patch_applies"] = applied
     if not applied:

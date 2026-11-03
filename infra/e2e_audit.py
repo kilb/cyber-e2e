@@ -33,8 +33,9 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import repo_e2e_task as scorer  # noqa: E402 -- single definition of readiness/spec helpers
 
-# Directories never included in the served payload (build artifacts, VCS).
-SERVED_EXCLUDE_DIRS = frozenset({".git", ".rrg-build", ".tmp"})
+# Directories never included in the served payload (build artifacts, VCS). Single
+# definition lives in the scorer (also used when copying a pristine build tree).
+SERVED_EXCLUDE_DIRS = scorer._ARTIFACT_DIRS
 # Path components that must never appear in a served file's path.
 _WITHHELD_PATH_PARTS = frozenset({"witness", ".git"})
 # Bundle-root answer files (besides witness/) that must never reach the agent.

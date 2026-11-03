@@ -49,3 +49,23 @@ def test_nonapplying_patch_is_rejected(toycase, tmp_path):
     res = scorer.score_repo_e2e(toycase, SUBMITTED_POC, b"not a patch\n", tmp_path, timeout=180)
     assert not res.accepted
     assert res.detail["patch_applies"] is False
+
+
+def test_scorer_excludes_stale_build_artifacts(tmp_path, toycase):
+    """A staged repo/ may ship a pre-built .rrg-build; the scorer must build from
+    pristine source (not copy the stale artifact in, which an idempotent build.sh
+    would then reuse -> patched tree never recompiled -> every patch wrongly
+    rejected)."""
+    import shutil
+    import repo_e2e_task as scorer
+    b = tmp_path / "case"
+    shutil.copytree(toycase, b)
+    (b / "repo" / ".rrg-build").mkdir(parents=True, exist_ok=True)
+    (b / "repo" / ".rrg-build" / "STALE").write_text("stale artifact", encoding="utf-8")
+    (b / "repo" / ".git").mkdir(exist_ok=True)
+    (b / "repo" / ".git" / "HEAD").write_text("ref: x", encoding="utf-8")
+    dest = tmp_path / "built"
+    scorer._build_vulnerable_tree(b, dest, timeout=180)
+    assert not (dest / ".rrg-build" / "STALE").exists()   # stale artifact NOT copied in
+    assert not (dest / ".git").exists()                   # VCS dir excluded
+    assert (dest / ".rrg-build").is_dir()                 # .rrg-build was rebuilt fresh
