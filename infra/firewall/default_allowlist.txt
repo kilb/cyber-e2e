@@ -8,9 +8,13 @@
 
 # --- Anthropic ---
 api.anthropic.com
-# --- OpenAI / Azure OpenAI ---
+# --- OpenAI ---
 api.openai.com
-openai.azure.com
+# --- Azure OpenAI: *.openai.azure.com is a SHARED multi-tenant apex (every
+# customer gets <resource-name>.openai.azure.com) -- the exact trap this file's
+# own header warns about, just missed here before. List your own resource's
+# exact hostname instead, e.g.:
+# myorg-prod.openai.azure.com
 # --- Google Gemini (the specific API host, NOT the googleapis.com apex) ---
 generativelanguage.googleapis.com
 # --- GLM / Zhipu (sibling-project worker model) ---

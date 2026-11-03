@@ -206,7 +206,13 @@ def crash_log_path(bundle_dir: Path | str) -> Path | None:
 
 
 def _reference_pocs(witness: Path) -> list[Path]:
-    refs = sorted(witness.glob("model_poc_reference.*"))
+    """Thin wrapper over `reference_poc_paths` (the single definition of ordering
+    -- fewest dotted segments first, so the primary ref is stable as more are
+    added) rather than a second, differently-ordered `sorted(glob(...))` that
+    would silently pick the wrong "primary" the moment two refs have different
+    suffixes (plain lexicographic sort puts `model_poc_reference.2.bin` before
+    `model_poc_reference.bin`, the opposite of the intended rule)."""
+    refs = reference_poc_paths(witness.parent)
     if not refs:
         raise ValueError("bundle ships no model_poc_reference.* (cannot score row 4)")
     return refs

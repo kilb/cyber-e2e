@@ -47,14 +47,27 @@ def _case_tokens(bundle: Path) -> set[str]:
     referenced the WITHHELD answer: the declared CVE id / fix-commit hash (and the
     regex-derived fallbacks from non-served files). The project/case NAME is
     deliberately NOT included -- the agent legitimately sees the project's own
-    source (which names it everywhere), so the name is noise, not a leak signal."""
+    source (which names it everywhere), so the name is noise, not a leak signal.
+
+    Passes the REAL served-file set (not an empty one) to `_secret_tokens`, so a
+    CVE id / hash that only appears in the agent's own legitimately-served
+    `repo/` is correctly excluded as a withheld-answer token -- using `set()`
+    here previously made any CVE mention anywhere in the repo (e.g. a benign
+    changelog entry for an unrelated old CVE) register as a leaked secret in
+    every trajectory that quoted it back, a false positive that erodes trust in
+    real hits."""
+    served_set = set(e2e_audit.served_source_files(bundle))
     return {t.decode("ascii", "replace").lower()
-            for t in e2e_audit._secret_tokens(bundle, set()) if t}
+            for t in e2e_audit._secret_tokens(bundle, served_set) if t}
 
 
 def scan_text(text: str, bundle: Path | str) -> dict:
     """Scan one trajectory string. Returns findings: secret-token hits, stray CVE
-    ids, and intel-host references. Empty `hits`/`intel` == clean."""
+    ids, and intel-host references. Empty `hits`/`cves`/`intel` == clean. A CVE
+    id mentioned ANYWHERE in the trajectory counts against `clean` even if it
+    isn't among the case's own declared secret tokens: the whole point of the
+    e2e contract is that the agent is never told a CVE applies at all, so any
+    CVE id in its own log is itself a leak signal, not just a case-specific one."""
     bundle = Path(bundle)
     low = text.lower()
     tokens = _case_tokens(bundle)
@@ -62,7 +75,7 @@ def scan_text(text: str, bundle: Path | str) -> dict:
     cves = sorted({m.group(0) for m in _CVE_RE.finditer(text)})
     intel = sorted({h for h in INTEL_HOSTS if h in low})
     return {"case_id": bundle.name, "secret_hits": hits, "cve_mentions": cves,
-            "intel_hosts": intel, "clean": not (hits or intel)}
+            "intel_hosts": intel, "clean": not (hits or cves or intel)}
 
 
 def scan_file(log_path: Path | str, bundle: Path | str) -> dict:

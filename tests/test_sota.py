@@ -224,9 +224,10 @@ def test_artifacts_persisted(tmp_path, toycase):
 # --------------------------------------------------------------------------- #
 def test_docker_hardening_flags():
     be = e2e_exec.DockerBackend(memory="4g", cpus="2")
-    args = be._base_args({"K": "V"}, ["/tmp"])
+    args = be._base_args({"K": "V"}, ["/tmp"], name="e2e-test-container")
     assert "--cap-drop" in args and "ALL" in args
     assert "--security-opt" in args and "no-new-privileges" in args
     assert "--pids-limit" in args
     assert "--memory" in args and "4g" in args
     assert "--cpus" in args and "2" in args
+    assert "--name" in args and "e2e-test-container" in args

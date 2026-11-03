@@ -81,10 +81,15 @@ def _discover_cases() -> tuple[tuple[str, ...], dict[str, str]]:
         if declared:
             declared = str(declared)
             if declared in alias:
-                print(f"WARNING: duplicate public_id {declared!r}; keeping dir name for {child.name}",
-                      file=sys.stderr)
-            else:
-                public = declared
+                # A declared public_id collision must NOT fall back to serving
+                # this case under its real directory name -- that name "may
+                # reveal the project/CVE" (see the docstring), so falling
+                # through would defeat task-id masking for exactly the case
+                # that hit an authoring mistake. Skip it loudly instead.
+                print(f"WARNING: duplicate public_id {declared!r} (dir {child.name}); "
+                      f"skipping case (fix the build.yaml collision)", file=sys.stderr)
+                continue
+            public = declared
         if public in alias:
             # The fallback dir name collides with an id already taken (e.g. an
             # earlier case declared this dir name as its public_id). Skip loudly
@@ -363,19 +368,32 @@ async def submit(case_id: str, request: Request,
     if len(patch) > MAX_PATCH_BYTES:
         raise HTTPException(status_code=413, detail=f"patch exceeds {MAX_PATCH_BYTES} bytes")
     _gc_old_jobs()
+    job_id = uuid.uuid4().hex
     with _jobs_lock:
+        # The admission check and the slot reservation (row insert) MUST happen
+        # under the same lock acquisition: checking `active` and inserting the
+        # new row in two separate locked blocks (as before) is a TOCTOU window
+        # -- concurrent submissions can all observe the pre-insert count and
+        # all be admitted, oversubscribing the concurrency cap. Inserting here
+        # makes this job count toward `active` for every request that acquires
+        # the lock afterward, closing the race.
         active = sum(1 for row in _jobs.values() if row["status"] in ("queued", "running"))
         if active >= MAX_CONCURRENT_JOBS * 4:
             raise HTTPException(status_code=429, detail="too many jobs in flight, try again shortly")
-    # Register the attempt only AFTER admission (so a 429 never burns it); an ERROR
-    # outcome is refunded in _run_job. Keyed by (case, mode).
-    _register_attempt(case_id, mode)
-    job_id = uuid.uuid4().hex
-    with _jobs_lock:
         _jobs[job_id] = {
             "job_id": job_id, "case_id": case_id, "mode": mode, "status": "queued",
             "created_at": time.time(), "result": None, "error": None,
         }
+    # Register the attempt only AFTER admission (so a 429 never burns it); an ERROR
+    # outcome is refunded in _run_job. Keyed by (case, mode). A 409 here must roll
+    # back the just-reserved slot, or a rejected attempt would still count against
+    # the concurrency cap forever (it's never picked up by _run_job to be GC'd).
+    try:
+        _register_attempt(case_id, mode)
+    except HTTPException:
+        with _jobs_lock:
+            _jobs.pop(job_id, None)
+        raise
     _executor.submit(_run_job, job_id, case_id, poc, patch, mode)
     return {"job_id": job_id, "status": "queued"}
 

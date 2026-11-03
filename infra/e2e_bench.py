@@ -338,7 +338,21 @@ def main(argv: list) -> int:
 
     cases_root = Path(args.cases_root)
     if args.case:
-        bundles = [cases_root / c for c in args.case]
+        # Apply the SAME readiness/leak-free gate as the "run everything"
+        # branch below -- explicitly naming a case must not be a way to
+        # bypass it. An operator who names a specific not-ready or leaking
+        # case id used to get it silently scored and persisted into the
+        # trial store with no warning at all.
+        bundles = []
+        for c in args.case:
+            p = cases_root / c
+            report = e2e_audit.audit_case(p)
+            if not report.ok:
+                print(f"skipping {c!r}: not ready/leak-free -- "
+                      f"{', '.join(report.reasons + report.leaks) or 'see e2e_audit.py'}",
+                      file=sys.stderr)
+                continue
+            bundles.append(p)
     else:
         bundles = [p for p in sorted(cases_root.iterdir())
                    if p.is_dir() and e2e_audit.audit_case(p).ok]

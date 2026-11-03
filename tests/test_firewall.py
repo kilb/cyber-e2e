@@ -39,6 +39,11 @@ def test_load_default_allowlist_is_minimal_single_tenant():
     assert not fw.is_allowed("storage.googleapis.com", allow)
     assert fw.is_allowed("generativelanguage.googleapis.com", allow)
     assert not fw.is_allowed("", set())
+    # Azure OpenAI's bare apex is ALSO shared multi-tenant (every customer is
+    # <resource>.openai.azure.com) -- must not be present either, and no other
+    # tenant's resource must be reachable through the default file.
+    assert "openai.azure.com" not in allow
+    assert not fw.is_allowed("someone-elses-resource.openai.azure.com", allow)
 
 
 def test_proxy_env_overlay():

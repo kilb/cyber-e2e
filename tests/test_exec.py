@@ -65,6 +65,40 @@ def test_host_backend_runs(tmp_path):
     assert r.returncode == 0 and "out" in r.stdout and (tree / "marker").exists()
 
 
+def test_host_backend_timeout_kills_whole_process_group(tmp_path):
+    """Regression for the orphan-process bug: `subprocess.run(..., timeout=...)`
+    only SIGKILLs the one directly-spawned process, so a command that
+    backgrounds a child used to leave that child running (and able to keep
+    mutating a tree a LATER trial reuses) after the timeout fired. The fixed
+    HostBackend runs commands in their own process group and `killpg`s it on
+    timeout -- verify the backgrounded descendant is actually dead afterward,
+    not just that the timeout fires."""
+    be = e2e_exec.HostBackend()
+    tree = tmp_path / "t"
+    tree.mkdir()
+    marker = tree / "child.alive"
+    # Backgrounds a child that would otherwise outlive a plain `.kill()` of the
+    # shell: it sleeps well past the timeout, touching `marker` once a second
+    # so we can tell afterward whether it's still running.
+    cmd = (
+        f"(i=0; while [ $i -lt 20 ]; do touch {marker} && sleep 1; i=$((i+1)); done) & "
+        "wait"
+    )
+    with pytest.raises(subprocess.TimeoutExpired):
+        be.run_shell(cmd, cwd=tree, env={}, timeout=1)
+    # Give the killed group's filesystem effects time to settle, then confirm
+    # the backgrounded loop stopped touching the marker (i.e. it was actually
+    # killed, not merely orphaned and still running in the background).
+    import time
+    assert marker.exists()  # it did start
+    mtime_at_kill = marker.stat().st_mtime
+    time.sleep(2.5)
+    assert marker.stat().st_mtime == mtime_at_kill, (
+        "backgrounded child kept running (mutating the tree) after the "
+        "parent's timeout -- process group was not actually killed"
+    )
+
+
 def test_docker_prepare_argv_and_memoize(tmp_path, monkeypatch):
     log = tmp_path / "shim.log"
     monkeypatch.setenv("SHIM_LOG", str(log))
@@ -85,7 +119,9 @@ def test_docker_prepare_argv_and_memoize(tmp_path, monkeypatch):
     be.run_shell("make all", cwd=tree, env={"TMPDIR": str(tree / ".tmp")}, timeout=30)
     run = [c for c in (json.loads(l) for l in log.read_text().splitlines()) if c[0] == "run"][0]
     uid_gid = f"{os.getuid()}:{os.getgid()}"
-    assert run[:4] == ["run", "--rm", "--network", "none"]
+    assert run[:2] == ["run", "--rm"]
+    assert "--name" in run  # lets a timed-out run be `docker kill`ed by name
+    assert "--network" in run and "none" in run
     assert "--user" in run and uid_gid in run
     assert "-w" in run and str(tree.resolve()) in run
     assert any(a == f"TMPDIR={tree / '.tmp'}" for a in run)
