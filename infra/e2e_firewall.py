@@ -52,9 +52,9 @@ def load_allowlist(path: Path | str | None = None) -> set[str]:
         return set()
     out: set[str] = set()
     for line in path.read_text(encoding="utf-8").splitlines():
-        line = line.split("#", 1)[0].strip().lower()
-        if line:
-            out.add(line.lstrip("."))
+        rule = line.split("#", 1)[0].strip().lower().lstrip(".")
+        if rule:                       # drop blanks and dots-only lines (no empty rule)
+            out.add(rule)
     return out
 
 
@@ -65,6 +65,7 @@ def is_allowed(host: str, allow: set[str]) -> bool:
     if not host:
         return False
     host = host.strip().lower().rstrip(".")
+    host = host.rsplit("@", 1)[-1]                                   # drop user:pass@ userinfo
     host = host.rsplit(":", 1)[0] if host.count(":") == 1 else host  # host:port (not IPv6)
     for rule in allow:
         if host == rule or host.endswith("." + rule):
@@ -92,11 +93,16 @@ class AllowlistProxy:
     """
 
     def __init__(self, allow: set[str], *, host: str = "127.0.0.1", port: int = 0,
-                 log_path: Path | str | None = None):
+                 log_path: Path | str | None = None, idle_timeout: int = 600,
+                 max_connections: int = 256):
         self.allow = set(allow)
         self.host = host
         self._want_port = port
         self.log_path = Path(log_path) if log_path else None
+        # Tunnels get a finite idle timeout so an agent cannot pin threads/fds with
+        # silent keep-alive CONNECTs; a semaphore caps concurrent connections.
+        self.idle_timeout = idle_timeout
+        self._sema = threading.BoundedSemaphore(max_connections)
         self._srv: socket.socket | None = None
         self._thread: threading.Thread | None = None
         self._stop = threading.Event()
@@ -159,10 +165,19 @@ class AllowlistProxy:
             threading.Thread(target=self._handle, args=(conn,), daemon=True).start()
 
     def _handle(self, conn: socket.socket) -> None:
+        if not self._sema.acquire(blocking=False):      # too many concurrent conns
+            try:
+                self._respond(conn, 503, "Proxy busy")
+            finally:
+                conn.close()
+            return
         try:
             conn.settimeout(30)
             header = self._read_header(conn)          # raw bytes (forwarded as-is)
             if not header:
+                return
+            if b"\r\n\r\n" not in header:             # never completed / oversized
+                self._respond(conn, 431, "Request Header Fields Too Large")
                 return
             request_line = header.split(b"\r\n", 1)[0].decode("latin-1")
             parts = request_line.split(" ")
@@ -177,6 +192,7 @@ class AllowlistProxy:
         except Exception:  # noqa: BLE001 -- a proxy must never crash the server on one bad conn
             pass
         finally:
+            self._sema.release()
             try:
                 conn.close()
             except OSError:
@@ -199,6 +215,7 @@ class AllowlistProxy:
             "Connection: close\r\n\r\n".encode() + body)
 
     def _do_connect(self, conn: socket.socket, target: str) -> None:
+        target = target.rsplit("@", 1)[-1]          # strip any userinfo
         host = target.rsplit(":", 1)[0]
         try:
             port = int(target.rsplit(":", 1)[1])
@@ -218,19 +235,21 @@ class AllowlistProxy:
         self._pump(conn, upstream)
 
     def _do_http(self, conn: socket.socket, method: str, target: str, header: bytes) -> None:
-        # absolute-form: http://host[:port]/path
-        host = ""
+        # absolute-form request line: METHOD http://host[:port]/path HTTP/x
+        authority, path = "", "/"
         if "://" in target:
             rest = target.split("://", 1)[1]
-            host = rest.split("/", 1)[0]
-        if not is_allowed(host, self.allow):
-            self._log("DENY", host or target)
+            authority, _, rem = rest.partition("/")
+            path = "/" + rem
+        authority = authority.rsplit("@", 1)[-1]        # strip userinfo
+        if not is_allowed(authority, self.allow):
+            self._log("DENY", authority or target)
             self._respond(conn, 403, "Forbidden by e2e egress allowlist")
             return
-        self._log("ALLOW", host)
-        hostname = host.rsplit(":", 1)[0] if host.count(":") == 1 else host
+        self._log("ALLOW", authority)
+        hostname = authority.rsplit(":", 1)[0] if authority.count(":") == 1 else authority
         try:
-            port = int(host.rsplit(":", 1)[1]) if host.count(":") == 1 else 80
+            port = int(authority.rsplit(":", 1)[1]) if authority.count(":") == 1 else 80
         except ValueError:
             port = 80
         try:
@@ -238,13 +257,19 @@ class AllowlistProxy:
         except OSError:
             self._respond(conn, 502, "Bad Gateway")
             return
-        upstream.sendall(header)  # pass the request through as-is (origin-form path kept)
+        # Rewrite the request line to RFC origin-form; origin servers reject the
+        # absolute-form a proxy receives. Headers/body after the first line are kept.
+        first, sep, tail = header.partition(b"\r\n")
+        bits = first.decode("latin-1").split(" ")
+        proto = bits[2] if len(bits) >= 3 else "HTTP/1.1"
+        upstream.sendall(f"{method} {path} {proto}".encode("latin-1") + sep + tail)
         self._pump(conn, upstream)
 
     def _pump(self, a: socket.socket, b: socket.socket) -> None:
-        """Bidirectional byte pump until either side closes."""
-        a.settimeout(None)
-        b.settimeout(None)
+        """Bidirectional byte pump until either side closes or goes idle past
+        `idle_timeout` (so a silent tunnel cannot pin threads/fds forever)."""
+        a.settimeout(self.idle_timeout)
+        b.settimeout(self.idle_timeout)
         done = threading.Event()
 
         def one(src, dst):

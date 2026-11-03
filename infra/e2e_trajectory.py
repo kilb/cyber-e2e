@@ -23,26 +23,33 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import e2e_audit  # noqa: E402 -- reuse the single secret-derivation
 
-# Hosts whose appearance in a trajectory suggests the agent sought the answer.
+# Hosts/paths whose appearance in a trajectory suggests the agent sought the
+# answer (fix commit, CVE record, upstream source, bug tracker). Substring match,
+# so these cover their subdomains (e.g. "githubusercontent" catches
+# raw.githubusercontent.com, which "github.com" does NOT).
 INTEL_HOSTS = (
-    "nvd.nist.gov", "cve.org", "cve.mitre.org", "oss-fuzz.com", "clusterfuzz",
-    "arvo", "security-tracker", "openwall.com", "seclists.org", "snyk.io",
-    "github.com", "gitlab.com", "bugs.chromium.org", "bugzilla",
+    # vuln databases / trackers
+    "nvd.nist.gov", "cve.org", "cve.mitre.org", "security-tracker", "snyk.io",
+    "openwall.com", "seclists.org", "bugs.chromium.org", "bugzilla",
+    "bugs.webkit.org", "huntr.dev", "vuldb.com", "cvedetails.com",
+    # fuzzing / ARVO / OSS-Fuzz
+    "oss-fuzz", "clusterfuzz", "arvo", "monorail",
+    # code hosts & fix sources (commits, patches, upstream trees)
+    "github.com", "githubusercontent", "gitlab.com", "googlesource.com",
+    "kernel.org", "sourceware.org", "gnu.org", "savannah", "sourceforge",
+    "bitbucket.org", "codeberg.org", "pypi.org", "patchwork", "gitweb",
 )
 _CVE_RE = re.compile(r"CVE-\d{4}-\d{3,}", re.I)
 
 
 def _case_tokens(bundle: Path) -> set[str]:
     """Lowercased strings that, if they appear in a trajectory, indicate the agent
-    referenced the withheld answer: the declared CVE/fix-commit secrets plus the
-    case directory name and its word components (a project-ish identifier the
-    agent is not supposed to know)."""
-    tokens = {t.decode("ascii", "replace").lower()
-              for t in e2e_audit._secret_tokens(bundle, set())}
-    name = bundle.name.lower()
-    tokens.add(name)
-    tokens.update(w for w in re.split(r"[^a-z0-9]+", name) if len(w) >= 4)
-    return {t for t in tokens if t}
+    referenced the WITHHELD answer: the declared CVE id / fix-commit hash (and the
+    regex-derived fallbacks from non-served files). The project/case NAME is
+    deliberately NOT included -- the agent legitimately sees the project's own
+    source (which names it everywhere), so the name is noise, not a leak signal."""
+    return {t.decode("ascii", "replace").lower()
+            for t in e2e_audit._secret_tokens(bundle, set()) if t}
 
 
 def scan_text(text: str, bundle: Path | str) -> dict:
@@ -76,7 +83,7 @@ def scan_firewall_log(fw_path: Path | str) -> dict:
     fw_path = Path(fw_path)
     denied, allowed = [], []
     try:
-        for line in fw_path.read_text(encoding="utf-8").splitlines():
+        for line in fw_path.read_text(encoding="utf-8", errors="replace").splitlines():
             parts = line.split()
             if len(parts) >= 3 and parts[1] == "DENY":
                 denied.append(parts[2])

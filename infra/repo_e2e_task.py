@@ -147,8 +147,11 @@ def reference_poc_paths(bundle_dir: Path | str) -> list[Path]:
     """Every row-4 reference PoC the case ships (sorted). A case MAY ship more than
     one (`model_poc_reference.bin`, `model_poc_reference.2.bin`, ...); row 4 then
     requires the patch to defeat ALL of them, a stronger anti-overfitting check
-    than a single ground-truth PoC. Single definition of the naming convention."""
-    return sorted((Path(bundle_dir) / "witness").glob("model_poc_reference.*"))
+    than a single ground-truth PoC. Single definition of the naming convention.
+    Ordered so the plain base name (fewest dotted segments) is first/'primary', so
+    adding `model_poc_reference.2.bin` never changes which PoC is the primary."""
+    refs = (Path(bundle_dir) / "witness").glob("model_poc_reference.*")
+    return sorted(refs, key=lambda p: (p.name.count("."), p.name))
 
 
 def reference_poc_path(bundle_dir: Path | str) -> Path | None:

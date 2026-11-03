@@ -85,6 +85,13 @@ def _discover_cases() -> tuple[tuple[str, ...], dict[str, str]]:
                       file=sys.stderr)
             else:
                 public = declared
+        if public in alias:
+            # The fallback dir name collides with an id already taken (e.g. an
+            # earlier case declared this dir name as its public_id). Skip loudly
+            # rather than silently clobbering and dropping a case.
+            print(f"WARNING: case id {public!r} already in use; skipping {child.name}",
+                  file=sys.stderr)
+            continue
         alias[public] = child.name
     return tuple(sorted(alias)), alias
 
@@ -235,12 +242,16 @@ def _run_job(job_id: str, case_id: str, poc: bytes | None, patch: bytes, mode: s
             _jobs[job_id]["status"] = "done"
             _jobs[job_id]["result"] = result
     except Exception as exc:  # noqa: BLE001
-        error = f"{type(exc).__name__}: {exc}"[-2000:]
+        # Sanitize BEFORE truncating (the real dir name tends to sit in the tail).
+        error = _sanitize_error(f"{type(exc).__name__}: {exc}", real_case, case_id)[-2000:]
         with _jobs_lock:
             _jobs[job_id]["status"] = "error"
             _jobs[job_id]["error"] = error
     finally:
         shutil.rmtree(work, ignore_errors=True)
+        # A scorer/infra ERROR is not agent-attributable -> refund the attempt.
+        if error:
+            _refund_attempt(case_id, mode)
         # Durable store keyed by the REAL case id (server-side analysis); the
         # agent-facing job row keeps the public id.
         _persist_result(job_id, real_case, mode, result, error)
@@ -281,18 +292,42 @@ def _require_mode(mode: str) -> str:
     return mode
 
 
-def _register_attempt(case_id: str) -> None:
-    """Enforce the per-task attempt cap (upstream's max_attempts=1) when
+def _register_attempt(case_id: str, mode: str) -> None:
+    """Enforce the per-(task, mode) attempt cap (upstream's max_attempts=1) when
     E2E_MAX_ATTEMPTS > 0. 0 (the default) == unlimited (pass@k research mode).
-    Raises 409 once a task's attempts are exhausted."""
+    Keyed by (case, mode) because e2e and patch-only are separate leaderboard rows,
+    so one must not lock out the other. Call only AFTER all admission checks pass,
+    so a 429 overload never consumes an attempt; a later ERROR is refunded in
+    `_run_job`. Raises 409 once a task+mode's attempts are exhausted."""
     if not MAX_ATTEMPTS:
         return
     with _attempts_lock:
-        used = _attempts.get(case_id, 0)
+        used = _attempts.get((case_id, mode), 0)
         if used >= MAX_ATTEMPTS:
             raise HTTPException(status_code=409,
-                                detail=f"attempt limit reached for {case_id} (max_attempts={MAX_ATTEMPTS})")
-        _attempts[case_id] = used + 1
+                                detail=f"attempt limit reached for {case_id} ({mode}) "
+                                       f"(max_attempts={MAX_ATTEMPTS})")
+        _attempts[(case_id, mode)] = used + 1
+
+
+def _refund_attempt(case_id: str, mode: str) -> None:
+    """Give back an attempt consumed by a submission that ended in a non-agent-
+    attributable ERROR (scorer/infra failure) -- consistent with ERROR trials being
+    excluded from the pass-rate denominators."""
+    if not MAX_ATTEMPTS:
+        return
+    with _attempts_lock:
+        if _attempts.get((case_id, mode), 0) > 0:
+            _attempts[(case_id, mode)] -= 1
+
+
+def _sanitize_error(msg: str, real_case: str, public_id: str) -> str:
+    """Scrub the real (masked) directory name and server paths from an error string
+    before it is returned to the agent via the job row."""
+    msg = msg.replace(str(CASES_ROOT), "<cases>")
+    if real_case and real_case != public_id:
+        msg = msg.replace(real_case, public_id)
+    return msg
 
 
 @app.get("/cases/{case_id}/source.zip")
@@ -328,11 +363,13 @@ async def submit(case_id: str, request: Request,
     if len(patch) > MAX_PATCH_BYTES:
         raise HTTPException(status_code=413, detail=f"patch exceeds {MAX_PATCH_BYTES} bytes")
     _gc_old_jobs()
-    _register_attempt(case_id)  # leaderboard-integrity attempt cap (no-op if unlimited)
     with _jobs_lock:
         active = sum(1 for row in _jobs.values() if row["status"] in ("queued", "running"))
         if active >= MAX_CONCURRENT_JOBS * 4:
             raise HTTPException(status_code=429, detail="too many jobs in flight, try again shortly")
+    # Register the attempt only AFTER admission (so a 429 never burns it); an ERROR
+    # outcome is refunded in _run_job. Keyed by (case, mode).
+    _register_attempt(case_id, mode)
     job_id = uuid.uuid4().hex
     with _jobs_lock:
         _jobs[job_id] = {

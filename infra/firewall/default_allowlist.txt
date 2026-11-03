@@ -1,22 +1,23 @@
 # cybergym-e2e agent egress allowlist (SUFFIX match: `anthropic.com` also allows
-# `api.anthropic.com`). The agent may reach its LLM provider and nothing else, so
-# it cannot fetch the CVE writeup / upstream fix / ARVO record. Keep this MINIMAL.
+# `api.anthropic.com`). The agent may reach its LLM provider and NOTHING else, so
+# it cannot fetch the CVE writeup / upstream fix / ARVO record. Keep this MINIMAL
+# and keep it to SINGLE-TENANT vendor API hosts -- never a shared-cloud apex like
+# `googleapis.com` / `amazonaws.com`, which would also allow any GCS/S3 bucket or
+# API-Gateway relay the agent could stash/fetch the answer through.
 # One domain per line; '#' comments and blank lines ignored.
 
 # --- Anthropic ---
-anthropic.com
+api.anthropic.com
 # --- OpenAI / Azure OpenAI ---
-openai.com
+api.openai.com
 openai.azure.com
-# --- Google / Gemini / Vertex ---
-googleapis.com
+# --- Google Gemini (the specific API host, NOT the googleapis.com apex) ---
 generativelanguage.googleapis.com
-# --- AWS Bedrock ---
-amazonaws.com
 # --- GLM / Zhipu (sibling-project worker model) ---
-bigmodel.cn
-z.ai
-# --- Common model gateways (uncomment only what your harness actually needs) ---
+open.bigmodel.cn
+api.z.ai
+# --- Add ONLY your exact provider endpoint(s). Examples (uncomment/edit): ---
+# bedrock-runtime.us-east-1.amazonaws.com        # AWS Bedrock (region-specific)
+# us-central1-aiplatform.googleapis.com          # Vertex AI (region-specific)
 # openrouter.ai
-# api.together.xyz
 # api.deepseek.com

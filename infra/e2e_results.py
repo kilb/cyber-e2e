@@ -186,7 +186,8 @@ def _failure_breakdown(valid: list[dict]) -> dict:
     counts: dict[str, int] = {}
     for t in valid:
         if not _is_pass(t):
-            counts[_first_failure(t)] = counts.get(_first_failure(t), 0) + 1
+            stage = _first_failure(t)
+            counts[stage] = counts.get(stage, 0) + 1
     return counts
 
 

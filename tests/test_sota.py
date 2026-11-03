@@ -82,22 +82,47 @@ def test_no_public_id_uses_dir_name(tmp_path, toycase):
     assert srv.CASES == ("plaincase",) and srv._ALIAS["plaincase"] == "plaincase"
 
 
+def test_public_id_clobber_is_skipped_not_silently_dropped(tmp_path, toycase):
+    root = tmp_path / "cases"
+    shutil.copytree(toycase, root / "alpha")
+    shutil.copytree(toycase, root / "beta")
+    with (root / "alpha" / "build.yaml").open("a", encoding="utf-8") as f:
+        f.write("\npublic_id: beta\n")          # alpha claims the id "beta"
+    srv = _import_server(root)
+    # the real dir "beta" collides with alpha's public_id -> beta skipped, alpha kept
+    assert srv.CASES == ("beta",)
+    assert srv._ALIAS["beta"] == "alpha"          # no KeyError; CASES keys == _ALIAS keys
+
+
 # --------------------------------------------------------------------------- #
 # max_attempts (gap #7)
 # --------------------------------------------------------------------------- #
 def test_max_attempts_gate(tmp_path, toycase):
     srv = _import_server(_make_cases_root(tmp_path, toycase), E2E_MAX_ATTEMPTS=1)
     assert srv.MAX_ATTEMPTS == 1
-    srv._register_attempt("toycase")                     # first attempt ok
+    srv._register_attempt("toycase", "e2e")              # first attempt ok
     with pytest.raises(srv.HTTPException):               # second exceeds the cap
-        srv._register_attempt("toycase")
+        srv._register_attempt("toycase", "e2e")
+    # patch-only is a separate leaderboard row -> NOT blocked by the e2e attempt
+    srv._register_attempt("toycase", "patch-only")
+    # an ERROR refunds the attempt -> the slot is usable again
+    srv._refund_attempt("toycase", "e2e")
+    srv._register_attempt("toycase", "e2e")
 
 
 def test_unlimited_attempts_by_default(tmp_path, toycase):
     srv = _import_server(_make_cases_root(tmp_path, toycase))
     assert srv.MAX_ATTEMPTS == 0
     for _ in range(3):
-        srv._register_attempt("toycase")                 # never raises
+        srv._register_attempt("toycase", "e2e")          # never raises
+
+
+def test_error_string_does_not_leak_real_dir_name(tmp_path, toycase):
+    srv = _import_server(_make_cases_root(tmp_path, toycase, name="curl-arvo-SECRET",
+                                          extra_yaml="\npublic_id: task-xyz\n"))
+    msg = srv._sanitize_error(
+        "ValueError: not a scorable bundle: /x/cases/curl-arvo-SECRET", "curl-arvo-SECRET", "task-xyz")
+    assert "curl-arvo-SECRET" not in msg and "task-xyz" in msg
 
 
 # --------------------------------------------------------------------------- #
