@@ -69,3 +69,21 @@ def test_scorer_excludes_stale_build_artifacts(tmp_path, toycase):
     assert not (dest / ".rrg-build" / "STALE").exists()   # stale artifact NOT copied in
     assert not (dest / ".git").exists()                   # VCS dir excluded
     assert (dest / ".rrg-build").is_dir()                 # .rrg-build was rebuilt fresh
+
+
+def test_copy_source_normalizes_mtimes(tmp_path, toycase):
+    """_copy_source must flatten all source mtimes to one fixed past value so a
+    staged tree's inconsistent mtimes can't trigger autotools maintainer-mode regen
+    (while git apply at NOW still forces a rebuild of patched files)."""
+    import os
+    import repo_e2e_task as scorer
+    src = tmp_path / "repo"
+    (src / "sub").mkdir(parents=True)
+    (src / "a.c").write_text("x", encoding="utf-8")
+    (src / "sub" / "b.h").write_text("y", encoding="utf-8")
+    # make one file artificially "new" to simulate broken ordering
+    os.utime(src / "a.c", (2_000_000_000, 2_000_000_000))
+    dst = tmp_path / "out"
+    scorer._copy_source(src, dst)
+    for rel in ("a.c", "sub/b.h"):
+        assert abs((dst / rel).stat().st_mtime - scorer._SOURCE_MTIME) < 2, rel

@@ -45,9 +45,32 @@ _PROBE = "e2e_probe.py"  # per-case oracle, authored by the GLM worker
 _ARTIFACT_DIRS = frozenset({".git", ".rrg-build", ".tmp"})
 
 
+# A single fixed, past mtime stamped on every copied source file. copytree(copy2)
+# preserves the staged tree's mtimes, which can be inconsistent (a tarball/staging
+# can leave a GENERATED file e.g. aclocal.m4 OLDER than its source e.g. configure.ac);
+# make/autotools then fires a maintainer-mode regeneration rule that needs a toolchain
+# the host may not have (autoreconf/automake version) and the build fails -- on BOTH
+# trees, so it is a case-build defect, not an agent failure. Flattening every file to
+# one past timestamp removes all such ordering: nothing is "newer" than anything else,
+# so no regen fires and pre-built objects aren't seen as stale, while `git apply` on the
+# patched tree writes its files at NOW (> this stamp) so the patch still triggers a
+# rebuild. Deterministic and content-preserving (mtime only; the audit checks content).
+_SOURCE_MTIME = 1_600_000_000  # 2020-09-13 UTC, fixed
+
+
 def _copy_source(src: Path, dst: Path) -> None:
-    """Copy a pristine source tree, excluding build-artifact/VCS dirs (_ARTIFACT_DIRS)."""
+    """Copy a pristine source tree, excluding build-artifact/VCS dirs (_ARTIFACT_DIRS),
+    then normalize all mtimes to a single fixed past value (see _SOURCE_MTIME)."""
     shutil.copytree(src, dst, ignore=shutil.ignore_patterns(*_ARTIFACT_DIRS))
+    for path in dst.rglob("*"):
+        try:
+            os.utime(path, (_SOURCE_MTIME, _SOURCE_MTIME), follow_symlinks=False)
+        except (OSError, NotImplementedError):
+            pass
+    try:
+        os.utime(dst, (_SOURCE_MTIME, _SOURCE_MTIME))
+    except OSError:
+        pass
 
 
 def _git_apply(tree: Path, patch_path: Path) -> tuple[bool, str]:
