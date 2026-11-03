@@ -193,6 +193,15 @@ def render_html(agg: dict, title: str = "cybergym-e2e leaderboard") -> str:
             f"<td>{_usd(c.get('usd_cost'))}</td><td>{_num(c.get('tokens'))}</td>"
             f"<td>{_secs(c.get('solve_s'))}</td></tr>")
 
+    rows_stage = []
+    for m in _ranked_models(agg):
+        cells = "".join(f"<td>{_frac(m.stages.get(k))}</td>" for k in _STAGE_LABEL)
+        top = max(m.failures.items(), key=lambda kv: kv[1], default=(None, 0))
+        top_s = f"{_STAGE_LABEL.get(top[0], top[0])} ({top[1]})" if top[0] else "-"
+        rows_stage.append(f"<tr><td class='model'>{e(m.model)}</td><td>{e(m.mode)}</td>"
+                          f"{cells}<td>{e(top_s)}</td></tr>")
+    stage_hdr = "".join(f"<th>{e(lbl)}</th>" for lbl in _STAGE_LABEL.values())
+
     ks_extra = _ks_extra(ks)
     kcols = "".join(f"<th>pass@{k}</th>" for k in ks_extra)
     rows_case = []
@@ -218,6 +227,9 @@ def render_html(agg: dict, title: str = "cybergym-e2e leaderboard") -> str:
 <h2>Per-case results</h2>
 <table><thead><tr><th>case</th><th>model</th><th>mode</th><th>n</th><th>pass@1</th><th>95% CI</th>{kcols}<th>errors</th></tr></thead>
 <tbody>{''.join(rows_case)}</tbody></table>
+<h2>Stage pass rates &amp; failure diagnosis</h2>
+<table><thead><tr><th>model</th><th>mode</th>{stage_hdr}<th>top failure</th></tr></thead>
+<tbody>{''.join(rows_stage)}</tbody></table>
 <footer>cybergym-e2e · generated from the trial store</footer>
 </main></body></html>
 """

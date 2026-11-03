@@ -124,8 +124,27 @@ def _make_record(case_id, model, trial, *, verdict, accepted, reason, mode="e2e"
     }
 
 
+def _save_artifacts(root: Path, case_id, model, trial, poc, patch, work: Path) -> None:
+    """Persist a trial's submittable artifacts (upstream requires poc.bin +
+    fix.patch per task and trajectories/logs for >=10 tasks): the (poc, patch)
+    bytes and the agent's log. Best-effort; never fails the run."""
+    dest = root / case_id / model / f"trial{trial}"
+    try:
+        dest.mkdir(parents=True, exist_ok=True)
+        if poc is not None:
+            (dest / "poc.bin").write_bytes(poc)
+        if patch is not None:
+            (dest / "fix.patch").write_bytes(patch)
+        log = Path(work) / "agent.log"
+        if log.is_file():
+            shutil.copy2(log, dest / "agent.log")
+    except OSError:
+        pass
+
+
 def run_benchmark(*, bundles, models, n_trials, solver, store, work_root,
-                  score_context=None, timeout=1800, mode="e2e", on_trial=None) -> list[dict]:
+                  score_context=None, timeout=1800, mode="e2e", on_trial=None,
+                  artifacts_dir=None) -> list[dict]:
     """Run n_trials of each (case, model), persisting each trial as it completes.
 
     `score_context(bundle)` returns a per-case scoring context (see module doc);
@@ -133,6 +152,8 @@ def run_benchmark(*, bundles, models, n_trials, solver, store, work_root,
     passed to both the solver and the scorer. The context is built once per case
     and closed when the case's trials finish; a context-build failure turns every
     trial of that case into an ERROR trial rather than crashing the run.
+    `artifacts_dir`, if set, persists each trial's (poc, patch, agent.log) for a
+    submittable/reproducible run.
     """
     store = Path(store)
     work_root = Path(work_root)
@@ -172,6 +193,8 @@ def run_benchmark(*, bundles, models, n_trials, solver, store, work_root,
                             error=f"{type(exc).__name__}: {exc}\n{traceback.format_exc()[-800:]}")
                     stored = R.append_trial(store, rec)
                     records.append(stored)
+                    if artifacts_dir:
+                        _save_artifacts(Path(artifacts_dir), case_id, model, trial, poc, patch, work)
                     if on_trial:
                         on_trial(stored)
         finally:
@@ -304,6 +327,10 @@ def main(argv: list) -> int:
                     help="allowlist file for --firewall (default: infra/firewall/default_allowlist.txt)")
     ap.add_argument("--report-md", default=None)
     ap.add_argument("--report-html", default=None)
+    ap.add_argument("--results-json", default=None, help="write upstream-parity results.json")
+    ap.add_argument("--submission-yaml", default=None, help="write upstream-parity YAML report")
+    ap.add_argument("--artifacts-dir", default=None,
+                    help="persist each trial's poc.bin/fix.patch/agent.log (for submission)")
     ap.add_argument("--ks", default="1,5,10")
     args = ap.parse_args(argv[1:])
     if args.server and args.cache:
@@ -371,7 +398,7 @@ def main(argv: list) -> int:
         run_benchmark(bundles=bundles, models=args.model, n_trials=args.trials,
                       solver=solver, store=args.store, work_root=args.work_root,
                       score_context=score_context, timeout=args.timeout, mode=args.mode,
-                      on_trial=progress)
+                      on_trial=progress, artifacts_dir=args.artifacts_dir)
     finally:
         if firewall is not None:
             firewall.stop()
@@ -384,6 +411,12 @@ def main(argv: list) -> int:
         Path(args.report_md).write_text(markdown, encoding="utf-8")
     if args.report_html:
         Path(args.report_html).write_text(e2e_report.render_html(agg), encoding="utf-8")
+    if args.results_json:
+        import json
+        Path(args.results_json).write_text(json.dumps(e2e_report.render_results_json(agg), indent=2),
+                                           encoding="utf-8")
+    if args.submission_yaml:
+        Path(args.submission_yaml).write_text(e2e_report.render_submission_yaml(agg), encoding="utf-8")
     return 0
 
 

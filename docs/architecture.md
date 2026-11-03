@@ -206,9 +206,14 @@ comparable and reproducible.
   per-stage pass fractions (the two build gates + the four rows) and a
   "where did it first fail" breakdown, plus the four-category token breakdown
   (input / cache-read / cache-write / output), wall time, and LLM-request count.
-- **Submission emitters**. `e2e_report --results-json / --submission-yaml` produce
-  the upstream-parity `results.json` (one entry per task×mode) and YAML report, so
-  our runs are directly comparable/submittable.
+- **Submission emitters & artifacts**. `e2e_report --results-json / --submission-yaml`
+  (also exposed on `e2e_bench`) produce the upstream-parity `results.json` (one
+  entry per task×mode) and YAML report; `e2e_bench --artifacts-dir` persists each
+  trial's `poc.bin`/`fix.patch`/`agent.log` so a run is directly submittable and
+  independently re-validatable.
+- **Determinism**. Sanitizer-based oracles need a stable ASLR entropy
+  (`vm.mmap_rnd_bits=28` on the host); the oracle author owns the target's
+  `ASAN_OPTIONS`. See `docs/environment.md`.
 - **Container hardening**. The Docker backend runs build/test/oracle with
   `--cap-drop ALL`, `--security-opt no-new-privileges`, a `--pids-limit`, and
   optional `--memory`/`--cpus` caps (env `E2E_DOCKER_MEMORY/CPUS/PIDS`) — a tighter

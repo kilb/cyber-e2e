@@ -61,3 +61,25 @@ means:
   this is fine, the `setsid` child survives independently; just confirm (via
   a separate ssh probe) that the child is alive, then stop the now-redundant
   wrapper task.
+
+## Determinism for sanitizer-based oracles (ASan/UBSan)
+
+Real cases whose oracle relies on a sanitizer (ASan/UBSan) need a stable ASLR
+entropy for the report to be reproducible across the vulnerable-tree and
+patched-tree observations. Upstream pins it; do the same on the execution host:
+
+```sh
+sudo sysctl -w vm.mmap_rnd_bits=28     # ASan compatibility (persist in /etc/sysctl.d/ if wanted)
+```
+
+Division of responsibility: the **host** owns `vm.mmap_rnd_bits` (set once per
+box). The **oracle author (GLM)** owns the target's sanitizer env — e.g.
+`ASAN_OPTIONS=abort_on_error=1:detect_leaks=0:...` — set inside
+`witness/e2e_probe.py` for the binary it spawns, so a fault is detected
+deterministically and a benign run stays clean. The scorer gives each step its
+own private `TMPDIR`; everything else about the target's environment is the
+oracle's to control (see `docs/case-authoring.md`).
+
+With the **Docker backend**, run the container host with the sysctl above; the
+container inherits the host's ASLR setting. The backend already fixes a clean,
+reproducible container env (declared `system_packages`, no host env leakage).

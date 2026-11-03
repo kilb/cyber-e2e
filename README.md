@@ -76,7 +76,8 @@ See `docs/architecture.md` for the full component map and trust boundaries.
       diagnosis; upstream-parity `results.json` + YAML submission emitters.
     - `e2e_bench.py` — N-trials-per-(case,model) runner; injectable solver +
       per-case scoring context (fresh / `--cache` / `--server`); `--backend`,
-      `--firewall`; writes a reproducibility manifest + leaderboard.
+      `--firewall`, `--artifacts-dir` (persist poc/patch/log), `--results-json` /
+      `--submission-yaml`; writes a reproducibility manifest + leaderboard.
     - `e2e_local.py` — single-run convenience runner.
   - **Ops** — `start_server.sh` (uvicorn on 8900), `sandbox_wrapper.sh`
     (unprivileged PID-isolated bwrap), `e2e_firewall.py start` (egress proxy).

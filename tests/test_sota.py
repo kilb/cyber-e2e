@@ -192,6 +192,33 @@ def test_markdown_has_stage_section():
     assert "Stage pass rates" in md and "s4 ref-clean" in md
 
 
+def test_html_has_stage_section():
+    html = e2e_report.render_html(R.aggregate(_MIX, ks=(1,)))
+    assert "Stage pass rates" in html and "s4 ref-clean" in html
+    assert "http://" not in html and "https://" not in html   # still self-contained
+
+
+# --------------------------------------------------------------------------- #
+# artifact persistence for submittable runs (gap: upstream requires saved poc/patch)
+# --------------------------------------------------------------------------- #
+def test_artifacts_persisted(tmp_path, toycase):
+    import e2e_bench
+    poc = b"\x40\x00\x00\x00" + b"A" * 64
+
+    def solver(bundle, model, work):
+        (work / "agent.log").write_text("ran the agent\n", encoding="utf-8")
+        return poc, (bundle / "fix.patch").read_bytes(), {"solve_s": 1.0}
+
+    arts = tmp_path / "arts"
+    e2e_bench.run_benchmark(
+        bundles=[toycase], models=["m"], n_trials=1, solver=solver,
+        store=tmp_path / "t.jsonl", work_root=tmp_path / "w",
+        score_context=e2e_bench.fresh_context(300), timeout=300, artifacts_dir=arts)
+    d = arts / "toycase" / "m" / "trial0"
+    assert (d / "poc.bin").read_bytes() == poc
+    assert (d / "fix.patch").is_file() and (d / "agent.log").is_file()
+
+
 # --------------------------------------------------------------------------- #
 # Docker containment flags (gap #9)
 # --------------------------------------------------------------------------- #
