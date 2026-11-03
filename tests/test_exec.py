@@ -115,6 +115,7 @@ def _base_image_available(img="ubuntu:24.04"):
 
 @pytest.mark.skipif(not _base_image_available(), reason="no base image available offline")
 def test_real_docker_scores_toycase(tmp_path, toycase):
+    e2e_exec._image_cache.clear()  # don't reuse a fake tag a shim test may have cached
     be = e2e_exec.DockerBackend(base_image="ubuntu:24.04", network="none")
     res = scorer.score_repo_e2e(toycase, SUBMITTED_POC, (toycase / "fix.patch").read_bytes(),
                                 tmp_path / "w", timeout=1200, backend=be)

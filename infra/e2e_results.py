@@ -150,7 +150,44 @@ def load_trials(store: Path | str) -> list[dict]:
 # --------------------------------------------------------------------------- #
 # aggregation
 # --------------------------------------------------------------------------- #
-_COST_KEYS = ("solve_s", "tokens", "usd_cost", "llm_requests")
+# Per-model token breakdown upstream reports: non-cached input, cache read, cache
+# write, output (kept alongside the single `tokens` total for back-compat).
+_TOKEN_KEYS = ("tokens_input", "tokens_cache_read", "tokens_cache_write", "tokens_output")
+_COST_KEYS = ("solve_s", "tokens", "usd_cost", "llm_requests", *_TOKEN_KEYS)
+
+# Stage order for per-stage pass fractions and first-failure diagnosis. A stage is
+# scored only over trials where it is not None (patch-only has no row1/row2).
+STAGE_ORDER = ROW_KEYS
+
+
+def _stage_fractions(valid: list[dict]) -> dict:
+    """Fraction of valid trials that pass each stage (None where the stage does not
+    apply to any of them, e.g. row1/row2 in a pure patch-only set)."""
+    out = {}
+    for key in STAGE_ORDER:
+        present = [t.get("rows", {}).get(key) for t in valid]
+        present = [v for v in present if v is not None]
+        out[key] = (sum(1 for v in present if v) / len(present)) if present else None
+    return out
+
+
+def _first_failure(trial: dict) -> str:
+    """The earliest stage that failed in a trial (the stage that cost the point)."""
+    rows = trial.get("rows", {})
+    for key in STAGE_ORDER:
+        if rows.get(key) is False:
+            return key
+    return "unknown"
+
+
+def _failure_breakdown(valid: list[dict]) -> dict:
+    """Among the FAILing valid trials, how many first failed at each stage -- the
+    'where do agents fail' diagnostic (SOTA long-horizon-agent evaluation)."""
+    counts: dict[str, int] = {}
+    for t in valid:
+        if not _is_pass(t):
+            counts[_first_failure(t)] = counts.get(_first_failure(t), 0) + 1
+    return counts
 
 
 @dataclasses.dataclass
@@ -179,6 +216,8 @@ class ModelAgg:
     n_valid: int
     n_error: int
     cost: dict                   # {metric: mean over valid trials or None}
+    stages: dict = dataclasses.field(default_factory=dict)    # {row_key: pass fraction}
+    failures: dict = dataclasses.field(default_factory=dict)  # {stage: #first-failed}
 
 
 def _is_pass(t: dict) -> bool:
@@ -234,11 +273,13 @@ def aggregate(trials: list[dict], ks: tuple = (1, 5, 10)) -> dict:
         pooled_valid = sum(cm.n_valid for cm in cms)
         pooled_succ = sum(cm.successes for cm in cms)
         micro = (pooled_succ / pooled_valid) if pooled_valid else 0.0
+        pvt = pooled_valid_trials.get((model, mode), [])
         model_aggs.append(ModelAgg(
             model=model, mode=mode, cases_attempted=attempted, cases_solved_any=solved_any,
             macro_pass1=macro, micro_pass1=micro, n_valid=pooled_valid,
             n_error=sum(cm.n_error for cm in cms),
-            cost=_cost_means(pooled_valid_trials.get((model, mode), []))))
+            cost=_cost_means(pvt), stages=_stage_fractions(pvt),
+            failures=_failure_breakdown(pvt)))
 
     return {"by_case_model": case_model, "by_model": model_aggs, "ks": list(ks)}
 

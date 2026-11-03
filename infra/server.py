@@ -52,34 +52,49 @@ _ROW_KEYS = _results.ROW_KEYS
 BACKEND_KIND = os.environ.get("E2E_BACKEND", "host")
 
 
-def _discover_cases() -> tuple[str, ...]:
-    """Advertise only FULLY-CONVERTED, LEAK-FREE e2e cases. A subdir of
-    CASES_ROOT is listed only when it passes the CHEAP structural gate
-    `e2e_audit.audit_case(..., scan_content=False).ok`: e2e-ready (repo/ +
+def _discover_cases() -> tuple[tuple[str, ...], dict[str, str]]:
+    """Advertise only FULLY-CONVERTED, LEAK-FREE e2e cases, under an OPAQUE public
+    id. A subdir of CASES_ROOT is listed only when it passes the CHEAP structural
+    gate `e2e_audit.audit_case(..., scan_content=False).ok`: e2e-ready (repo/ +
     witness/e2e_probe.py + a row-4 reference PoC + a non-empty row-3 test suite)
     AND free of structural leaks (no served file named like / pathed under a
-    withheld artifact). This gate does NOT read file contents, so it does not by
-    itself prove the stronger content-level leak-freedom (no byte-identical
-    renamed copies, no fingerprinting CVE/commit in content). That full audit is a
-    required pre-flight step (`e2e_audit.py` / `e2e_certify.py`) before a case goes
-    live -- kept out of startup because reading every file of every large repo on
-    each restart would be slow. Discovered fresh at import time; restart the server
-    after a case becomes ready (same restart-to-register discipline as the sibling
-    project)."""
+    withheld artifact). This gate does NOT read file contents; the full content
+    audit (byte-identical copies, fingerprinting CVE/commit) is a required
+    pre-flight (`e2e_audit.py` / `e2e_certify.py`) before a case goes live.
+
+    TASK-ID MASKING: the agent must not be able to derive the project/CVE from the
+    id it is served. A case may declare an opaque `public_id` in build.yaml; the
+    server advertises THAT and maps it back internally. Absent one, the directory
+    name is used (backward compatible). Returns (advertised_public_ids, {public ->
+    real dir}). Discovered fresh at import time; restart to re-register."""
     if not CASES_ROOT.is_dir():
-        return ()
-    found = []
+        return (), {}
+    alias: dict[str, str] = {}
     for child in sorted(CASES_ROOT.iterdir()):
-        # Cheap structural gate at startup (readiness + no answer artifacts in
-        # repo/). The full content leak scan is a pre-flight step run via
-        # e2e_audit.py / e2e_certify.py before a case goes live, not on every
-        # restart (reading every file of every large repo would be slow).
-        if child.is_dir() and e2e_audit.audit_case(child, scan_content=False).ok:
-            found.append(child.name)
-    return tuple(found)
+        if not (child.is_dir() and e2e_audit.audit_case(child, scan_content=False).ok):
+            continue
+        public = child.name
+        try:
+            declared = _task.load_spec(child).get("public_id")
+        except Exception:  # noqa: BLE001 -- unreadable build.yaml => case not ready anyway
+            declared = None
+        if declared:
+            declared = str(declared)
+            if declared in alias:
+                print(f"WARNING: duplicate public_id {declared!r}; keeping dir name for {child.name}",
+                      file=sys.stderr)
+            else:
+                public = declared
+        alias[public] = child.name
+    return tuple(sorted(alias)), alias
 
 
-CASES = _discover_cases()
+CASES, _ALIAS = _discover_cases()
+# Per-task attempt cap for leaderboard-integrity runs (upstream accepts
+# max_attempts=1). 0 == unlimited (benchmark/pass@k research mode, the default).
+MAX_ATTEMPTS = int(os.environ.get("E2E_MAX_ATTEMPTS", "0") or "0")
+_attempts: dict[str, int] = {}
+_attempts_lock = threading.Lock()
 
 MAX_POC_BYTES = 262144
 MAX_PATCH_BYTES = 262144
@@ -112,9 +127,12 @@ def _require_api_key(x_api_key: str | None) -> None:
 
 
 def _bundle_dir(case_id: str) -> Path:
+    """Resolve an advertised (public) case id to its real bundle directory. The
+    agent only ever uses the public id; the real dir name (which may reveal the
+    project/CVE) stays server-side."""
     if case_id not in CASES:
         raise HTTPException(status_code=404, detail=f"unknown case_id: {case_id}")
-    bundle = CASES_ROOT / case_id
+    bundle = CASES_ROOT / _ALIAS[case_id]
     if not bundle.is_dir():
         raise HTTPException(status_code=500, detail=f"bundle missing on server: {case_id}")
     return bundle
@@ -155,8 +173,9 @@ def _public_view(case_id: str) -> dict[str, Any]:
 
 def _zip_source(case_id: str, mode: str) -> bytes:
     """The agent download. e2e: ONLY repo/ (never build.yaml, fix.patch, NOTES,
-    witness). patch-only: repo/ PLUS the reference PoC as poc.bin (the given input).
-    Memoized per (case, mode) for the server's lifetime."""
+    witness). patch-only: repo/ PLUS the given inputs -- the reference PoC as
+    poc.bin and, when the case ships one, the crash trace as crash.log (upstream's
+    patch-only provides source + crash log + PoC). Memoized per (case, mode)."""
     cached = _zip_cache.get((case_id, mode))
     if cached is not None:
         return cached
@@ -169,6 +188,9 @@ def _zip_source(case_id: str, mode: str) -> bytes:
             ref = _task.reference_poc_path(bundle)
             if ref is not None:
                 zf.write(ref, arcname="poc.bin")
+            crash = _task.crash_log_path(bundle)
+            if crash is not None:
+                zf.write(crash, arcname="crash.log")
     data = buf.getvalue()
     with _zip_lock:
         _zip_cache[(case_id, mode)] = data
@@ -202,8 +224,9 @@ def _run_job(job_id: str, case_id: str, poc: bytes | None, patch: bytes, mode: s
     work = WORK_ROOT / job_id
     result = None
     error = None
+    real_case = _ALIAS.get(case_id, case_id)  # resolve public id -> real dir
     try:
-        bundle = CASES_ROOT / case_id
+        bundle = CASES_ROOT / real_case
         backend = e2e_exec.make_backend(BACKEND_KIND)  # fresh per job (per-case image state)
         score = _task.score_repo_e2e(bundle, poc, patch, work, timeout=SCORE_TIMEOUT_SECONDS,
                                      mode=mode, backend=backend)
@@ -218,7 +241,9 @@ def _run_job(job_id: str, case_id: str, poc: bytes | None, patch: bytes, mode: s
             _jobs[job_id]["error"] = error
     finally:
         shutil.rmtree(work, ignore_errors=True)
-        _persist_result(job_id, case_id, mode, result, error)
+        # Durable store keyed by the REAL case id (server-side analysis); the
+        # agent-facing job row keeps the public id.
+        _persist_result(job_id, real_case, mode, result, error)
         with _jobs_lock:
             _jobs[job_id]["finished_at"] = time.time()
 
@@ -256,6 +281,20 @@ def _require_mode(mode: str) -> str:
     return mode
 
 
+def _register_attempt(case_id: str) -> None:
+    """Enforce the per-task attempt cap (upstream's max_attempts=1) when
+    E2E_MAX_ATTEMPTS > 0. 0 (the default) == unlimited (pass@k research mode).
+    Raises 409 once a task's attempts are exhausted."""
+    if not MAX_ATTEMPTS:
+        return
+    with _attempts_lock:
+        used = _attempts.get(case_id, 0)
+        if used >= MAX_ATTEMPTS:
+            raise HTTPException(status_code=409,
+                                detail=f"attempt limit reached for {case_id} (max_attempts={MAX_ATTEMPTS})")
+        _attempts[case_id] = used + 1
+
+
 @app.get("/cases/{case_id}/source.zip")
 def download_source(case_id: str, mode: str = "e2e",
                     x_api_key: str | None = Header(default=None)) -> Response:
@@ -289,6 +328,7 @@ async def submit(case_id: str, request: Request,
     if len(patch) > MAX_PATCH_BYTES:
         raise HTTPException(status_code=413, detail=f"patch exceeds {MAX_PATCH_BYTES} bytes")
     _gc_old_jobs()
+    _register_attempt(case_id)  # leaderboard-integrity attempt cap (no-op if unlimited)
     with _jobs_lock:
         active = sum(1 for row in _jobs.values() if row["status"] in ("queued", "running"))
         if active >= MAX_CONCURRENT_JOBS * 4:

@@ -119,3 +119,44 @@ coordinator (Claude) re-runs the real scorer on controls:
 These mirror the sibling project's reference+negative certification, extended
 for the patch dimension. Claude runs this certification; GLM authors the
 per-case files it certifies.
+
+## Optional per-case enhancements (framework-supported)
+
+These are optional files/keys the framework honors when present; a case without
+them behaves exactly as before.
+
+### Multiple reference PoCs (stronger row 4)
+
+Ship more than one `witness/model_poc_reference.*` (e.g.
+`model_poc_reference.bin`, `model_poc_reference.2.bin`). Row 4 then requires the
+agent's patch to defeat **every** reference PoC — a patch that only neutralizes
+one specific ground-truth input is rejected. The first (sorted) reference is the
+"primary" used as the patch-only given input and the certify submission.
+
+### witness/crash.log (patch-only given input)
+
+In **patch-only** mode upstream provides source + crash log + PoC. If a case
+ships `witness/crash.log`, the server serves it as `crash.log` alongside
+`poc.bin` in patch-only downloads. It stays **withheld in e2e** (it is under
+`witness/`, so the audit withholds it and byte-identical-copy detection applies).
+Author it as the real sanitizer/crash trace for the vulnerability.
+
+### build.yaml `public_id` (task-id masking)
+
+The agent must not be able to derive the project/CVE from the id it is served.
+Declare an opaque id and the server advertises **that** instead of the directory
+name, mapping it back internally:
+
+```yaml
+public_id: task-7f3a2c         # opaque; never the project/CVE name
+```
+
+Absent one, the directory name is used (backward compatible). Keep the directory
+name off the served tree regardless (the audit warns on stray identifiers).
+
+### system_packages must be container-complete
+
+With the Docker backend, `system_packages` is installed into a **clean** base
+image, so declare everything the build needs — e.g. `build-essential` (not bare
+`gcc`, which lacks the libc headers in a clean container). Host mode treats the
+list as a precondition (the host already has a toolchain).

@@ -143,18 +143,34 @@ def _observe(closure: Path, tree: Path, poc_name: str, *, timeout: int,
     return body
 
 
+def reference_poc_paths(bundle_dir: Path | str) -> list[Path]:
+    """Every row-4 reference PoC the case ships (sorted). A case MAY ship more than
+    one (`model_poc_reference.bin`, `model_poc_reference.2.bin`, ...); row 4 then
+    requires the patch to defeat ALL of them, a stronger anti-overfitting check
+    than a single ground-truth PoC. Single definition of the naming convention."""
+    return sorted((Path(bundle_dir) / "witness").glob("model_poc_reference.*"))
+
+
 def reference_poc_path(bundle_dir: Path | str) -> Path | None:
-    """The row-4 reference PoC path, or None if the case ships none. Single
-    definition of the model_poc_reference.* naming convention."""
-    refs = sorted((Path(bundle_dir) / "witness").glob("model_poc_reference.*"))
+    """The PRIMARY (first) row-4 reference PoC, or None. Used where a single
+    canonical PoC is wanted (patch-only input, certify submission)."""
+    refs = reference_poc_paths(bundle_dir)
     return refs[0] if refs else None
 
 
-def _reference_poc(witness: Path) -> Path:
+def crash_log_path(bundle_dir: Path | str) -> Path | None:
+    """The optional crash trace (`witness/crash.log`). Withheld in e2e, but served
+    as the given input in patch-only (upstream's patch-only provides source + crash
+    log + PoC). None if the case ships none."""
+    p = Path(bundle_dir) / "witness" / "crash.log"
+    return p if p.is_file() else None
+
+
+def _reference_pocs(witness: Path) -> list[Path]:
     refs = sorted(witness.glob("model_poc_reference.*"))
     if not refs:
         raise ValueError("bundle ships no model_poc_reference.* (cannot score row 4)")
-    return refs[0]
+    return refs
 
 
 def readiness_reasons(bundle_dir: Path | str) -> list[str]:
@@ -267,14 +283,15 @@ def _score_core(bundle_dir: Path, vulnerable_built: Path, poc: bytes | None, pat
     env = extra_env if extra_env is not None else _private_tmp(work)
     repo = bundle_dir / "repo"
     witness = bundle_dir / "witness"
-    ref_poc = _reference_poc(witness)
+    ref_pocs = _reference_pocs(witness)
+    primary_ref = ref_pocs[0]
 
     closure = work / "closure"
     shutil.copytree(witness, closure)
-    reference_name = ref_poc.name
+    reference_names = [p.name for p in ref_pocs]
     submitted_name = None
     if mode == "e2e":
-        submitted_name = f"submitted_poc{ref_poc.suffix}"
+        submitted_name = f"submitted_poc{primary_ref.suffix}"
         (closure / submitted_name).write_bytes(poc or b"")
     patch_path = work / "agent.patch"
     patch_path.write_bytes(patch)
@@ -322,10 +339,22 @@ def _score_core(bundle_dir: Path, vulnerable_built: Path, poc: bytes | None, pat
     if not row3:
         detail["row3_detail"] = tests_log
 
-    r4 = _observe(closure, patched, reference_name, timeout=timeout, extra_env=env, backend=backend)
-    row4 = not bool(r4.get("faulted"))
+    # Row 4: the patch must defeat EVERY independent reference PoC (a patch that
+    # only blocks the agent's exact input, or one specific ground-truth input, is
+    # a narrow non-fix). Observe each; row4 holds iff none faults the patched tree.
+    row4 = True
+    row4_by_ref = {}
+    for name in reference_names:
+        r4 = _observe(closure, patched, name, timeout=timeout, extra_env=env, backend=backend)
+        faulted = bool(r4.get("faulted"))
+        row4_by_ref[name] = {"faulted": faulted, "detail": r4.get("detail")}
+        if faulted:
+            row4 = False
     detail["row4_reference_clean_on_patch"] = row4
-    detail["row4_detail"] = r4.get("detail")
+    detail["row4_reference_count"] = len(reference_names)
+    # Keep the single-reference detail shape stable; expand only when there are many.
+    detail["row4_detail"] = (row4_by_ref[reference_names[0]]["detail"]
+                             if len(reference_names) == 1 else row4_by_ref)
 
     accepted, reason = _verdict(row1, row2, row3, row4, mode)
     return RepoE2EScore(accepted, reason, detail)
@@ -456,4 +485,4 @@ class CaseContext:
 
 __all__ = ["RepoE2EScore", "CaseContext", "is_case_ready", "readiness_reasons",
            "score_repo_e2e", "load_spec", "declared_public_tests", "reference_poc_path",
-           "MODES"]
+           "reference_poc_paths", "crash_log_path", "MODES"]

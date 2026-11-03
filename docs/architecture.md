@@ -17,7 +17,7 @@ submission is **accepted** iff all four rows hold:
 | 1 | submitted PoC faults the **vulnerable** tree | a PoC that doesn't actually reproduce anything |
 | 2 | submitted PoC does **not** fault the agent's **patched** tree | a patch that doesn't stop the agent's own PoC |
 | 3 | the project's **own test suite** still passes on the patched tree | a "fix" that breaks functionality (regression) |
-| 4 | an **independent reference PoC** does not fault the patched tree | a narrow patch that only defeats the agent's exact input, not the bug class |
+| 4 | **every independent reference PoC** does not fault the patched tree | a narrow patch that only defeats the agent's exact input (or one ground-truth input), not the bug class |
 
 Rows 3 and 4 are what make this *end-to-end* rather than PoC-generation: they
 reject a patch that is a regression or a narrow non-fix even when rows 1–2 pass.
@@ -51,8 +51,10 @@ reject a patch that is a regression or a narrow non-fix even when rows 1–2 pas
      e2e_certify.py  accepted / no-op / narrow controls via the REAL scorer
      e2e_bench.py    N trials/(case,model); pluggable solver+scorer; manifest
      e2e_results.py  durable JSONL trial store; pass@1 (Wilson CI) + pass@k; aggregate
-     e2e_report.py   markdown + self-contained HTML leaderboard
+     e2e_report.py   markdown + HTML leaderboard; stage diagnosis; results.json + YAML
      e2e_local.py    single-run convenience runner
+     e2e_firewall.py agent egress allowlist proxy (keeps the agent off the answer)
+     e2e_trajectory.py post-hoc trajectory leak scan (did the agent look up the fix?)
 ```
 
 ### Who owns what (division of labor)
@@ -174,6 +176,44 @@ Select with `e2e_bench --backend host|docker [--base-image … --network …]`, 
 server's `E2E_BACKEND` / `E2E_BASE_IMAGE` / `E2E_DOCKER_NETWORK` env. The host path
 is behavior-identical to before; the backend only changes *where* commands run.
 
+## Benchmark integrity & SOTA controls
+
+Beyond the 4-row matrix, several controls defend the *measurement* itself — that
+the agent solved the task rather than looked up the answer, and that scores are
+comparable and reproducible.
+
+- **Agent egress firewall** (`e2e_firewall.py`). The whole contract rests on the
+  agent not fetching the CVE writeup / upstream fix / ARVO record. A dependency-
+  free threaded forward proxy permits CONNECT/HTTP only to an allowlisted set of
+  domains (default: LLM API providers in `infra/firewall/default_allowlist.txt`),
+  denies everything else with 403, and logs every ALLOW/DENY decision — the deny
+  log doubles as a cheating signal. `e2e_bench --firewall` starts one for a run and
+  routes the agent through it. The proxy is the *policy*; enforcing that the agent
+  uses only it is the deployment's job (run the agent in a netns/container whose
+  sole egress route is the proxy — the cooperative `HTTP(S)_PROXY` env is a
+  convenience, not containment).
+- **Trajectory leak scan** (`e2e_trajectory.py`). The detective complement: it
+  reads the agent's own log for the case's declared secrets (CVE/fix-commit,
+  derived from the same single source as the audit), the masked project id, and
+  references to vuln-intel hosts (NVD, OSS-Fuzz/ARVO, commit URLs), and
+  cross-checks the firewall deny log. A hit flags a trial for review.
+- **Task-id masking**. A case may declare an opaque `public_id` in `build.yaml`;
+  the server advertises that and maps it back internally, so the served id never
+  reveals the project/CVE (absent one, the directory name is used).
+- **Attempt cap**. `E2E_MAX_ATTEMPTS` (default 0 = unlimited, for pass@k research)
+  enforces the upstream leaderboard semantics `max_attempts=1` per task.
+- **Stage diagnosis & token breakdown**. The report aggregates, per model×mode, the
+  per-stage pass fractions (the two build gates + the four rows) and a
+  "where did it first fail" breakdown, plus the four-category token breakdown
+  (input / cache-read / cache-write / output), wall time, and LLM-request count.
+- **Submission emitters**. `e2e_report --results-json / --submission-yaml` produce
+  the upstream-parity `results.json` (one entry per task×mode) and YAML report, so
+  our runs are directly comparable/submittable.
+- **Container hardening**. The Docker backend runs build/test/oracle with
+  `--cap-drop ALL`, `--security-opt no-new-privileges`, a `--pids-limit`, and
+  optional `--memory`/`--cpus` caps (env `E2E_DOCKER_MEMORY/CPUS/PIDS`) — a tighter
+  containment boundary for a maliciously-crafted patch/PoC.
+
 ## Trust model & isolation
 
 Leak prevention keeps the *answer* from the agent; it does not sandbox execution.
@@ -245,10 +285,13 @@ suite runs against.
 ## Running it
 
 ```sh
-python -m pytest                    # 30 tests, ~3s (needs a C compiler for the toy case)
+python -m pytest                    # 77 tests, ~8s (needs a C compiler; +Docker for the real-container test)
 python infra/e2e_audit.py   cases/<case>        # leakage/readiness audit
 python infra/e2e_certify.py cases/<case>        # certify via the real scorer
-python infra/e2e_bench.py --cases-root cases --model <m> --trials 5 --cache \
-       --report-html results/leaderboard.html   # run the benchmark + leaderboard
-python infra/e2e_report.py results/trials.jsonl --html results/leaderboard.html
+python infra/e2e_firewall.py start              # agent egress allowlist proxy (standalone)
+python infra/e2e_bench.py --cases-root cases --model <m> --trials 5 --cache --firewall \
+       --backend docker --report-html results/leaderboard.html   # benchmark + leaderboard
+python infra/e2e_report.py results/trials.jsonl --html results/leaderboard.html \
+       --results-json results/results.json --submission-yaml results/submission.yaml
+python infra/e2e_trajectory.py cases/<case> work/<run>/agent.log results/trials.firewall.log
 ```

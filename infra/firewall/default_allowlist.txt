@@ -1,0 +1,22 @@
+# cybergym-e2e agent egress allowlist (SUFFIX match: `anthropic.com` also allows
+# `api.anthropic.com`). The agent may reach its LLM provider and nothing else, so
+# it cannot fetch the CVE writeup / upstream fix / ARVO record. Keep this MINIMAL.
+# One domain per line; '#' comments and blank lines ignored.
+
+# --- Anthropic ---
+anthropic.com
+# --- OpenAI / Azure OpenAI ---
+openai.com
+openai.azure.com
+# --- Google / Gemini / Vertex ---
+googleapis.com
+generativelanguage.googleapis.com
+# --- AWS Bedrock ---
+amazonaws.com
+# --- GLM / Zhipu (sibling-project worker model) ---
+bigmodel.cn
+z.ai
+# --- Common model gateways (uncomment only what your harness actually needs) ---
+# openrouter.ai
+# api.together.xyz
+# api.deepseek.com

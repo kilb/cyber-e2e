@@ -1,5 +1,7 @@
 lock_id: toycase-synthetic-selftest-build
-system_packages: [bash, gcc, make]
+# build-essential (not bare gcc) so a CLEAN container has the libc headers too;
+# host mode treats these as a precondition (the host already has a toolchain).
+system_packages: [bash, build-essential]
 environment:
   LC_ALL: C.UTF-8
   PYTHONDONTWRITEBYTECODE: "1"

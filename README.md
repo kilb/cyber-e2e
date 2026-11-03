@@ -55,25 +55,33 @@ See `docs/architecture.md` for the full component map and trust boundaries.
     - `e2e_exec.py` — execution backends: `HostBackend` (default) and
       `DockerBackend` ("plan B": base image + declared `system_packages`, image
       content-cached) for reproducible, isolated, network-policied scoring.
-    - `server.py` — submission API: serves `repo/` ONLY (plus the reference PoC in
-      patch-only), discovery gated on the leak audit, async job queue; `mode` per
-      submission; optional durable result store (`E2E_RESULTS`); backend via
-      `E2E_BACKEND`.
+    - `server.py` — submission API: serves `repo/` ONLY (plus the reference PoC +
+      crash log in patch-only), discovery gated on the leak audit, async job queue;
+      `mode` per submission; opaque `public_id` task-id masking; per-task attempt
+      cap (`E2E_MAX_ATTEMPTS`); optional durable result store (`E2E_RESULTS`);
+      backend via `E2E_BACKEND`.
   - **Harness (SOTA layer)**
     - `e2e_audit.py` — leakage + readiness audit (withheld check derived from the
       bundle's own `witness/`, incl. byte-identical-copy detection); the single
       `served_source_files` definition the server reuses; `case_fingerprint`.
     - `e2e_certify.py` — accepted / no-op / narrow controls via the real scorer.
+    - `e2e_firewall.py` — agent egress allowlist proxy (keeps the agent off the
+      CVE/fix; default allowlist = LLM API domains); logs ALLOW/DENY decisions.
+    - `e2e_trajectory.py` — post-hoc trajectory leak scan (did the agent look up
+      the fix?), derived from the same secret set as the audit.
     - `e2e_results.py` — durable JSONL trial store; pass@1 (Wilson CI) + pass@k
-      (unbiased estimator); aggregation; run manifest.
-    - `e2e_report.py` — markdown + self-contained HTML leaderboard.
+      (unbiased estimator); per-stage pass fractions + failure diagnosis;
+      four-category token breakdown; aggregation; run manifest.
+    - `e2e_report.py` — markdown + self-contained HTML leaderboard with stage
+      diagnosis; upstream-parity `results.json` + YAML submission emitters.
     - `e2e_bench.py` — N-trials-per-(case,model) runner; injectable solver +
-      per-case scoring context (fresh / `--cache` / `--server`); writes a
-      reproducibility manifest + leaderboard.
+      per-case scoring context (fresh / `--cache` / `--server`); `--backend`,
+      `--firewall`; writes a reproducibility manifest + leaderboard.
     - `e2e_local.py` — single-run convenience runner.
   - **Ops** — `start_server.sh` (uvicorn on 8900), `sandbox_wrapper.sh`
-    (unprivileged PID-isolated bwrap).
-- `tests/` — pytest suite (30 tests). `tests/fixtures/toycase` is a synthetic
+    (unprivileged PID-isolated bwrap), `e2e_firewall.py start` (egress proxy).
+- `tests/` — pytest suite (77 tests; 76 run anywhere, the real-docker scoring
+  test runs where a base image is available). `tests/fixtures/toycase` is a synthetic
   fully-converted case that certifies the whole pipeline in seconds.
 - `cases/` — one directory per e2e case once built (empty here; the 1.8 GB trees
   live on blk.so). Each case's observe-only `witness/e2e_probe.py`, row-3
@@ -85,7 +93,7 @@ See `docs/architecture.md` for the full component map and trust boundaries.
 ```sh
 python -m venv .venv && . .venv/bin/activate
 pip install -r requirements-dev.txt
-python -m pytest                                  # 30 tests (~3s; needs a C compiler)
+python -m pytest                                  # 77 tests (~8s; needs a C compiler; +Docker for the real-container test)
 python infra/e2e_certify.py tests/fixtures/toycase   # certify the self-test case
 ```
 

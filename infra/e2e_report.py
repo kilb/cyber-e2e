@@ -8,15 +8,32 @@ from __future__ import annotations
 
 import argparse
 import html as _html
+import json
 import sys
 from pathlib import Path
+
+import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import e2e_results as R  # noqa: E402
 
+# Short, stable labels for the 4-row matrix + the two build gates.
+_STAGE_LABEL = {
+    "patch_applies": "applies",
+    "patch_builds": "builds",
+    "row1_poc_faults_vulnerable": "s1 reproduce",
+    "row2_poc_clean_on_patch": "s2 poc-fixed",
+    "row3_tests_pass_on_patch": "s3 tests",
+    "row4_reference_clean_on_patch": "s4 ref-clean",
+}
+
 
 def _pct(x: float) -> str:
     return f"{100 * x:.1f}%"
+
+
+def _frac(x) -> str:
+    return "-" if x is None else _pct(x)
 
 
 def _ranked_models(agg):
@@ -84,7 +101,56 @@ def render_markdown(agg: dict, title: str = "cybergym-e2e leaderboard") -> str:
             f"[{_pct(lo)}, {_pct(hi)}]", *kvals, str(cm.n_error),
         ]) + " |")
     out.append("")
+
+    # Stage pass rates + where agents fail (SOTA failure diagnosis).
+    out.append("## Stage pass rates & failure diagnosis")
+    out.append("")
+    stage_cols = [v for v in _STAGE_LABEL.values()]
+    hdr3 = ["model", "mode", *stage_cols, "top failure stage"]
+    out.append("| " + " | ".join(hdr3) + " |")
+    out.append("|" + "|".join(["---"] * len(hdr3)) + "|")
+    for m in _ranked_models(agg):
+        fracs = [_frac(m.stages.get(k)) for k in _STAGE_LABEL]
+        top = max(m.failures.items(), key=lambda kv: kv[1], default=(None, 0))
+        top_s = f"{_STAGE_LABEL.get(top[0], top[0])} ({top[1]})" if top[0] else "-"
+        out.append("| " + " | ".join([m.model, m.mode, *fracs, top_s]) + " |")
+    out.append("")
     return "\n".join(out)
+
+
+def render_results_json(agg: dict) -> dict:
+    """Upstream-parity `results.json`: one entry per (task, model, mode) with its
+    pass rate, pass@k, and cost. (Upstream requires one entry per task per mode for
+    every attempted task; at max_attempts=1 that is exactly n=1 per row.)"""
+    results = []
+    for cm in _sorted_cases(agg):
+        results.append({
+            "task": cm.case_id, "model": cm.model, "mode": cm.mode,
+            "n": cm.n_valid, "successes": cm.successes, "errors": cm.n_error,
+            "pass1": round(cm.pass1, 6), "pass_at_k": {str(k): round(v, 6) for k, v in cm.pass_at_k.items()},
+            "cost": {k: v for k, v in cm.cost.items() if v is not None},
+        })
+    return {"schema": "cybergym-e2e.results/v1", "results": results}
+
+
+def render_submission_yaml(agg: dict, title: str = "cybergym-e2e submission") -> str:
+    """Upstream-parity YAML report: per model x mode, the stage1-4 pass fractions,
+    pass rates, the token breakdown / wall time / LLM-request cost, and the
+    where-it-failed diagnosis."""
+    models = []
+    for m in _ranked_models(agg):
+        models.append({
+            "model": m.model, "mode": m.mode,
+            "macro_pass1": round(m.macro_pass1, 6), "micro_pass1": round(m.micro_pass1, 6),
+            "cases_solved": m.cases_solved_any, "cases_attempted": m.cases_attempted,
+            "valid_trials": m.n_valid, "errors": m.n_error,
+            "stages": {_STAGE_LABEL[k]: (None if v is None else round(v, 6))
+                       for k, v in m.stages.items()},
+            "failure_stages": {_STAGE_LABEL.get(k, k): n for k, n in sorted(m.failures.items())},
+            "cost": {k: (round(v, 6) if isinstance(v, float) else v)
+                     for k, v in m.cost.items() if v is not None},
+        })
+    return yaml.safe_dump({"title": title, "models": models}, sort_keys=False, allow_unicode=True)
 
 
 _CSS = """
@@ -162,6 +228,8 @@ def main(argv: list) -> int:
     ap.add_argument("store", help="path to the trials JSONL store")
     ap.add_argument("--md", default=None, help="write markdown to this file")
     ap.add_argument("--html", default=None, help="write HTML to this file")
+    ap.add_argument("--results-json", default=None, help="write upstream-parity results.json")
+    ap.add_argument("--submission-yaml", default=None, help="write upstream-parity YAML report")
     ap.add_argument("--ks", default="1,5,10", help="comma-separated k values for pass@k")
     ap.add_argument("--title", default="cybergym-e2e leaderboard")
     args = ap.parse_args(argv[1:])
@@ -174,7 +242,13 @@ def main(argv: list) -> int:
     if args.html:
         Path(args.html).write_text(render_html(agg, args.title), encoding="utf-8")
         print(f"wrote {args.html}")
-    if not args.md and not args.html:
+    if args.results_json:
+        Path(args.results_json).write_text(json.dumps(render_results_json(agg), indent=2), encoding="utf-8")
+        print(f"wrote {args.results_json}")
+    if args.submission_yaml:
+        Path(args.submission_yaml).write_text(render_submission_yaml(agg, args.title), encoding="utf-8")
+        print(f"wrote {args.submission_yaml}")
+    if not any((args.md, args.html, args.results_json, args.submission_yaml)):
         print(render_markdown(agg, args.title))
     return 0
 

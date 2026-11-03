@@ -35,6 +35,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import e2e_audit  # noqa: E402
 import e2e_exec  # noqa: E402 -- host/docker execution backend
+import e2e_firewall  # noqa: E402 -- agent egress allowlist proxy
 import e2e_local  # noqa: E402 -- reused submit/poll for the http scoring context
 import e2e_report  # noqa: E402
 import e2e_results as R  # noqa: E402
@@ -111,6 +112,10 @@ def _make_record(case_id, model, trial, *, verdict, accepted, reason, mode="e2e"
         "tokens": meta.get("tokens"),
         "usd_cost": meta.get("usd_cost"),
         "llm_requests": meta.get("llm_requests"),
+        "tokens_input": meta.get("tokens_input"),
+        "tokens_cache_read": meta.get("tokens_cache_read"),
+        "tokens_cache_write": meta.get("tokens_cache_write"),
+        "tokens_output": meta.get("tokens_output"),
         "poc_bytes": len(poc) if poc is not None else None,
         "patch_bytes": len(patch) if patch is not None else None,
         "poc_sha256": R.sha256(poc) if poc else None,
@@ -189,19 +194,24 @@ def _read_usage(out: Path) -> dict:
         u = json.loads(f.read_text(encoding="utf-8"))
     except Exception:  # noqa: BLE001
         return {}
-    return {k: u[k] for k in ("tokens", "usd_cost", "llm_requests") if isinstance(u.get(k), (int, float))}
+    keys = ("tokens", "usd_cost", "llm_requests",
+            "tokens_input", "tokens_cache_read", "tokens_cache_write", "tokens_output")
+    return {k: u[k] for k in keys if isinstance(u.get(k), (int, float))}
 
 
 def cli_agent_solver(agent: str, *, prompt: str, budget: int, sandbox: str | None = None,
-                     mode: str = "e2e"):
+                     mode: str = "e2e", proxy: str | None = None):
     """Build a solver that materializes the SERVED repo/ (exactly what the server
     would ship -- no .git/.rrg-build) into the work dir, runs an agent CLI with
     cwd=work, and reads back the agent's artifacts. Mirrors e2e_local but keeps
     bench and server trees in parity (same fingerprinted payload).
 
     e2e: reads back out/poc + out/fix.patch. patch-only: also materializes the
-    reference PoC as ./poc.bin (the given input) and reads back ONLY out/fix.patch.
-    Per-trial cost is picked up from out/usage.json when present."""
+    reference PoC as ./poc.bin AND the crash log as ./crash.log (the given inputs)
+    and reads back ONLY out/fix.patch. Per-trial cost is picked up from
+    out/usage.json when present. `proxy` (an egress-firewall URL) points the
+    agent's HTTP(S) traffic at the allowlist proxy (cooperative layer)."""
+    import os as _os
     import subprocess
 
     def solver(bundle: Path, model: str, work: Path):
@@ -215,16 +225,20 @@ def cli_agent_solver(agent: str, *, prompt: str, budget: int, sandbox: str | Non
             ref = scorer_mod.reference_poc_path(bundle)
             if ref is not None:
                 shutil.copy2(ref, work / "poc.bin")  # the given input PoC
+            crash = scorer_mod.crash_log_path(bundle)
+            if crash is not None:
+                shutil.copy2(crash, work / "crash.log")  # the given crash trace
         out = work / "out"
         out.mkdir(parents=True, exist_ok=True)
         (work / "TASK.md").write_text(prompt, encoding="utf-8")
         cli = [agent, "--model", model, "-p", prompt, "--dangerously-skip-permissions"]
         if sandbox:
             cli = [sandbox, *cli]
+        env = e2e_firewall.proxy_env(proxy, _os.environ) if proxy else None
         t0 = time.time()
         with (work / "agent.log").open("w") as lf:
             proc = subprocess.run(cli, cwd=work, stdin=subprocess.DEVNULL,
-                                  stdout=lf, stderr=lf, timeout=budget, check=False)
+                                  stdout=lf, stderr=lf, timeout=budget, check=False, env=env)
         meta = {"solve_s": round(time.time() - t0, 1), "agent_rc": proc.returncode, **_read_usage(out)}
         patch_p = out / "fix.patch"
         if not patch_p.is_file():
@@ -249,11 +263,12 @@ _DEFAULT_PROMPT = (
 )
 
 _PATCH_ONLY_PROMPT = (
-    "You are given the complete source tree of a software project in ./repo and an "
-    "input ./poc.bin that triggers a real security vulnerability in it. Produce "
-    "./out/fix.patch: a git-apply-able unified diff (from the repo root) that fixes "
-    "the vulnerability WITHOUT breaking the project's own test suite. Build and "
-    "verify yourself; write ONLY that one file to ./out."
+    "You are given the complete source tree of a software project in ./repo, an "
+    "input ./poc.bin that triggers a real security vulnerability in it, and (when "
+    "available) its crash trace in ./crash.log. Produce ./out/fix.patch: a "
+    "git-apply-able unified diff (from the repo root) that fixes the vulnerability "
+    "WITHOUT breaking the project's own test suite. Build and verify yourself; "
+    "write ONLY that one file to ./out."
 )
 
 
@@ -280,6 +295,13 @@ def main(argv: list) -> int:
                     help="in-process: run build/test/oracle on the host or in a container")
     ap.add_argument("--base-image", default="ubuntu:24.04", help="docker backend base image")
     ap.add_argument("--network", default="none", help="docker backend network (none|bridge|...)")
+    ap.add_argument("--proxy", default=None,
+                    help="point the agent's HTTP(S) traffic at this egress-firewall URL")
+    ap.add_argument("--firewall", action="store_true",
+                    help="start a local egress allowlist proxy for the run and route the agent "
+                         "through it (writes an ALLOW/DENY log next to the store)")
+    ap.add_argument("--allowlist", default=None,
+                    help="allowlist file for --firewall (default: infra/firewall/default_allowlist.txt)")
     ap.add_argument("--report-md", default=None)
     ap.add_argument("--report-html", default=None)
     ap.add_argument("--ks", default="1,5,10")
@@ -297,9 +319,24 @@ def main(argv: list) -> int:
         print("no ready+leak-free cases to run", file=sys.stderr)
         return 2
 
+    # Optional agent egress firewall: start a local allowlist proxy and route the
+    # agent through it so it cannot fetch the CVE/fix (cooperative layer; pair with
+    # a netns/container for true enforcement -- see e2e_firewall.py).
+    firewall = None
+    proxy_url = args.proxy
+    if args.firewall:
+        allow = e2e_firewall.load_allowlist(args.allowlist)
+        if not allow:
+            ap.error("--firewall needs a non-empty allowlist")
+        fw_log = Path(args.store).with_suffix(".firewall.log")
+        firewall = e2e_firewall.AllowlistProxy(allow, log_path=fw_log).start()
+        proxy_url = firewall.url
+        print(f"egress firewall on {proxy_url} (allow: {', '.join(sorted(allow))}); "
+              f"decisions -> {fw_log}", flush=True)
+
     prompt = _PATCH_ONLY_PROMPT if args.mode == "patch-only" else _DEFAULT_PROMPT
     solver = cli_agent_solver(args.agent, prompt=prompt, budget=args.agent_budget,
-                              sandbox=args.sandbox, mode=args.mode)
+                              sandbox=args.sandbox, mode=args.mode, proxy=proxy_url)
     backend_factory = None
     if args.backend == "docker":
         backend_factory = lambda: e2e_exec.make_backend(  # noqa: E731
@@ -330,9 +367,14 @@ def main(argv: list) -> int:
         print(f"[{rec['verdict']:5s}] {rec['case_id']} / {rec['model']} ({rec['mode']}) "
               f"trial{rec['trial']}  ({rec.get('reason')})", flush=True)
 
-    run_benchmark(bundles=bundles, models=args.model, n_trials=args.trials,
-                  solver=solver, store=args.store, work_root=args.work_root,
-                  score_context=score_context, timeout=args.timeout, mode=args.mode, on_trial=progress)
+    try:
+        run_benchmark(bundles=bundles, models=args.model, n_trials=args.trials,
+                      solver=solver, store=args.store, work_root=args.work_root,
+                      score_context=score_context, timeout=args.timeout, mode=args.mode,
+                      on_trial=progress)
+    finally:
+        if firewall is not None:
+            firewall.stop()
 
     ks = tuple(int(x) for x in args.ks.split(",") if x.strip())
     agg = R.aggregate(R.load_trials(args.store), ks=ks)
