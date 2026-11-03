@@ -70,7 +70,7 @@ cd infra && python3 e2e_bench.py \
   --cases-root ../cases --case <case-id> \
   --model <model-id> --agent claude --trials 1 \
   --timeout 1800 --agent-budget 10800 \
-  --backend docker --base-image ubuntu:24.04 --network none \
+  --backend docker --base-image ubuntu:26.04 --network none \
   --firewall --allowlist ../run_allowlist.txt \
   --store results/trials.jsonl --work-root results/work \
   --results-json results/results.json \

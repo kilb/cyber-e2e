@@ -339,7 +339,7 @@ def main(argv: list) -> int:
                     help="e2e (find+PoC+patch) or patch-only (fix given the PoC)")
     ap.add_argument("--backend", default="host", choices=["host", "docker"],
                     help="in-process: run build/test/oracle on the host or in a container")
-    ap.add_argument("--base-image", default="ubuntu:24.04", help="docker backend base image")
+    ap.add_argument("--base-image", default="ubuntu:26.04", help="docker backend base image")
     ap.add_argument("--network", default="none", help="docker backend network (none|bridge|...)")
     ap.add_argument("--proxy", default=None,
                     help="point the agent's HTTP(S) traffic at this egress-firewall URL")

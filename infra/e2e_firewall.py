@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as _dt
+import re
 import socket
 import sys
 import threading
@@ -82,6 +83,39 @@ def proxy_env(url: str, base: dict | None = None) -> dict:
     for k in ("NO_PROXY", "no_proxy"):
         env[k] = ""
     return env
+
+
+# Deliberately an ALLOWLIST of name patterns, not a blocklist of specific
+# known-sensitive names: generic shell/locale/proxy vars, plus whatever a
+# `source ~/.<model>` dotfile sets for model routing (ANTHROPIC_*/CLAUDE_*/
+# DEEPSEEK_*/OPENROUTER_*). Mirrors infra/sandbox_wrapper.sh's bwrap
+# --clearenv + --setenv allowlist (kept in sync by hand; same lesson applies
+# to both: naming vars to BLOCK -- E2E_API_KEY, RRG_POC_API_KEY, whatever else
+# an operator's shell happens to export -- is the same enumeration mistake
+# that already missed real paths on the filesystem side).
+_SAFE_ENV_RE = re.compile(
+    r"^(PATH|HOME|LANG|LC_[A-Z_]+|TERM|TMPDIR|TZ|SHELL|USER|LOGNAME|"
+    r"ANTHROPIC_[A-Z_]+|CLAUDE_[A-Z_]+|DEEPSEEK_[A-Z_]+|OPENROUTER_[A-Z_]+|"
+    r"HTTPS?_PROXY|https?_proxy|ALL_PROXY|all_proxy|NO_PROXY|no_proxy)$"
+)
+
+
+def minimal_agent_env(base_env: dict, *, proxy: str | None = None,
+                      extra: dict | None = None) -> dict:
+    """A MINIMAL environment for the agent's own process: only vars matching
+    the allowlist above survive from `base_env`, plus the proxy overlay (if
+    any) and any explicit `extra` overrides (e.g. a container-specific HOME).
+    For callers that run the agent OUTSIDE infra/sandbox_wrapper.sh's own
+    bwrap --clearenv (e.g. a Docker-isolated agent run, which has no bwrap
+    layer of its own to do this filtering) and so would otherwise pass the
+    launcher's full os.environ straight through -- an operator-exported
+    E2E_API_KEY or similar reaching the sandboxed/containerized agent
+    verbatim."""
+    out = {k: v for k, v in base_env.items() if _SAFE_ENV_RE.match(k)}
+    if proxy:
+        out = proxy_env(proxy, out)
+    out.update(extra or {})
+    return out
 
 
 class AllowlistProxy:

@@ -103,13 +103,13 @@ def test_docker_prepare_argv_and_memoize(tmp_path, monkeypatch):
     log = tmp_path / "shim.log"
     monkeypatch.setenv("SHIM_LOG", str(log))
     docker = _shim(tmp_path, _RECORDER, "docker")
-    be = e2e_exec.DockerBackend(base_image="ubuntu:24.04", network="none", docker=docker)
+    be = e2e_exec.DockerBackend(base_image="ubuntu:26.04", network="none", docker=docker)
     e2e_exec._image_cache.clear()
     be.prepare({"system_packages": ["gcc", "make"]})
     calls = [json.loads(l) for l in log.read_text().splitlines()]
     assert calls[0][0] == "build" and "-t" in calls[0]
     # a second prepare with the same spec must reuse the cached image (no 2nd build)
-    be2 = e2e_exec.DockerBackend(base_image="ubuntu:24.04", network="none", docker=docker)
+    be2 = e2e_exec.DockerBackend(base_image="ubuntu:26.04", network="none", docker=docker)
     be2.prepare({"system_packages": ["make", "gcc"]})  # order-independent
     builds = [c for c in (json.loads(l) for l in log.read_text().splitlines()) if c[0] == "build"]
     assert len(builds) == 1
@@ -133,7 +133,7 @@ def test_score_toycase_via_docker_shim(tmp_path, toycase):
     # scorer-through-DockerBackend flow (prepare + run_shell + run_oracle + mounts/env).
     docker = _shim(tmp_path, _EXECUTOR, "docker")
     e2e_exec._image_cache.clear()
-    be = e2e_exec.DockerBackend(base_image="ubuntu:24.04", network="none", docker=docker)
+    be = e2e_exec.DockerBackend(base_image="ubuntu:26.04", network="none", docker=docker)
     res = scorer.score_repo_e2e(toycase, SUBMITTED_POC, (toycase / "fix.patch").read_bytes(),
                                 tmp_path / "w", timeout=300, backend=be)
     assert res.accepted, (res.reason, res.detail)
@@ -141,7 +141,7 @@ def test_score_toycase_via_docker_shim(tmp_path, toycase):
     assert res.detail["row4_reference_clean_on_patch"] is True
 
 
-def _base_image_available(img="ubuntu:24.04"):
+def _base_image_available(img="ubuntu:26.04"):
     try:
         return subprocess.run(["docker", "image", "inspect", img],
                               capture_output=True, timeout=30).returncode == 0
@@ -152,7 +152,7 @@ def _base_image_available(img="ubuntu:24.04"):
 @pytest.mark.skipif(not _base_image_available(), reason="no base image available offline")
 def test_real_docker_scores_toycase(tmp_path, toycase):
     e2e_exec._image_cache.clear()  # don't reuse a fake tag a shim test may have cached
-    be = e2e_exec.DockerBackend(base_image="ubuntu:24.04", network="none")
+    be = e2e_exec.DockerBackend(base_image="ubuntu:26.04", network="none")
     res = scorer.score_repo_e2e(toycase, SUBMITTED_POC, (toycase / "fix.patch").read_bytes(),
                                 tmp_path / "w", timeout=1200, backend=be)
     assert res.accepted, (res.reason, res.detail)
