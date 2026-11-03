@@ -222,6 +222,28 @@ def _read_usage(out: Path) -> dict:
     return {k: u[k] for k in keys if isinstance(u.get(k), (int, float))}
 
 
+_sandbox_warned = False
+
+
+def _warn_if_no_sandbox(sandbox: str | None) -> None:
+    """`sandbox` is silently optional (`None` by default, no runtime check) --
+    unlike `HostBackend`, which prints a warning every time scoring runs
+    unsandboxed, forgetting `--sandbox infra/sandbox_wrapper.sh` here means
+    the AGENT's own process (not just the scoring step) runs with no
+    filesystem/env containment at all, with nothing in the output calling
+    that out. Warn once per process so it can't be missed in logs -- this
+    does not change behavior (a trusted/controlled single-box run may not
+    need the sandbox), it only makes the choice visible."""
+    global _sandbox_warned
+    if sandbox or _sandbox_warned:
+        return
+    print("[e2e_bench] WARNING: running the agent with no --sandbox: its own "
+          "process has NO filesystem/env containment (only the scoring step is "
+          "ever hardened by --backend docker). Pass --sandbox "
+          "infra/sandbox_wrapper.sh for any real/adversarial run.", file=sys.stderr)
+    _sandbox_warned = True
+
+
 def cli_agent_solver(agent: str, *, prompt: str, budget: int, sandbox: str | None = None,
                      mode: str = "e2e", proxy: str | None = None):
     """Build a solver that materializes the SERVED repo/ (exactly what the server
@@ -236,6 +258,7 @@ def cli_agent_solver(agent: str, *, prompt: str, budget: int, sandbox: str | Non
     agent's HTTP(S) traffic at the allowlist proxy (cooperative layer)."""
     import os as _os
     import subprocess
+    _warn_if_no_sandbox(sandbox)
 
     def solver(bundle: Path, model: str, work: Path):
         repo_dst = work / "repo"

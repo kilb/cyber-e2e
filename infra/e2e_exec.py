@@ -131,7 +131,8 @@ class DockerBackend:
     def __init__(self, base_image: str = "ubuntu:24.04", network: str = "none",
                  docker: str = "docker", build_timeout: int = 1800,
                  *, pids_limit: int = 1024, memory: str | None = _DEFAULT_DOCKER_MEMORY,
-                 cpus: str | None = _DEFAULT_DOCKER_CPUS, cap_drop: bool = True,
+                 cpus: str | None = _DEFAULT_DOCKER_CPUS,
+                 cpuset_cpus: str | None | bool = True, cap_drop: bool = True,
                  no_new_privs: bool = True):
         self.base_image = base_image
         self.network = network
@@ -149,6 +150,30 @@ class DockerBackend:
         # build needs.
         self.memory = memory                  # e.g. "4g" (None => unlimited)
         self.cpus = cpus                      # e.g. "2"  (None => unlimited)
+        # `--cpus` alone is CFS quota/period throttling: it slows the container
+        # down but does NOT change what nproc()/sched_getaffinity() report
+        # inside it, which still see the HOST's full core count. A case's own
+        # build.sh (`jobs=${RRG_BUILD_JOBS:-$(nproc)}`) then launches e.g.
+        # `make -j24` inside a container only entitled to 4 CPUs' worth of CFS
+        # time -- severe throttling, builds run far slower than correctly-sized
+        # parallelism would, raising the odds of a spurious timeout under
+        # concurrency (the exact failure mode `--cpus` was meant to prevent).
+        # `--cpuset-cpus` pins the container to an actual, small CPU set, so
+        # nproc() inside it honestly reports that count and `-j$(nproc)`
+        # self-sizes correctly. `True` (default) auto-derives a range from
+        # `cpus` when it's a plain integer (e.g. cpus="4" -> "0-3"); pass an
+        # explicit string to pin a specific set, or False/None to disable
+        # (accepting the nproc-overreports-capacity gap) for a case that
+        # genuinely needs to see the real core count.
+        if cpuset_cpus is True:
+            try:
+                n = int(cpus) if cpus else 0
+            except ValueError:
+                n = 0
+            cpuset_cpus = f"0-{n - 1}" if n > 1 else ("0" if n == 1 else None)
+        elif cpuset_cpus is False:
+            cpuset_cpus = None
+        self.cpuset_cpus = cpuset_cpus
         self.cap_drop = cap_drop              # drop all Linux capabilities
         self.no_new_privs = no_new_privs      # block setuid privilege escalation
         self._image: str | None = None
@@ -206,6 +231,8 @@ class DockerBackend:
             args += ["--memory", str(self.memory)]
         if self.cpus:
             args += ["--cpus", str(self.cpus)]
+        if self.cpuset_cpus:
+            args += ["--cpuset-cpus", str(self.cpuset_cpus)]
         for m in mounts:
             m = Path(m).resolve()
             args += ["-v", f"{m}:{m}"]
@@ -268,6 +295,7 @@ def make_backend(kind: str | None = None, *, base_image: str | None = None,
             # factory path is bounded by default too.
             memory=os.environ.get("E2E_DOCKER_MEMORY") or _DEFAULT_DOCKER_MEMORY,
             cpus=os.environ.get("E2E_DOCKER_CPUS") or _DEFAULT_DOCKER_CPUS,
+            cpuset_cpus=os.environ.get("E2E_DOCKER_CPUSET") or True,
             pids_limit=int(os.environ.get("E2E_DOCKER_PIDS", "1024") or "1024"))
     raise ValueError(f"unknown backend kind: {kind!r}")
 

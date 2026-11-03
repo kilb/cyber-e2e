@@ -5,9 +5,16 @@ through the real server, and record a durable summary.
 
 Generic plumbing only -- it never inspects, judges, or synthesizes any PoC /
 patch / vulnerability content; it just drives the agent CLI and ships whatever
-two files the agent leaves in the output slots to the scoring server. Run each
-agent inside the sandbox wrapper (infra/sandbox_wrapper.sh) so parallel runs of
-the same case get their own PID namespace.
+two files the agent leaves in the output slots to the scoring server. Pass
+`--sandbox infra/sandbox_wrapper.sh` to run the AGENT's own process (not this
+script) inside that bwrap sandbox for filesystem/env containment and its own
+PID namespace (mandatory for running >1 instance of the same case at once).
+Wrapping this whole script's own invocation instead (`sandbox_wrapper.sh
+python3 e2e_local.py run ...`) is NOT equivalent and does not work correctly:
+the wrapper masks $HOME and re-exposes only the directory it is invoked FROM,
+which for this script is whatever directory the operator happened to be in,
+not `--work-dir` -- `--sandbox` here applies the wrapper to just the agent
+subprocess, whose `cwd` genuinely is `--work-dir`.
 
 Usage:
   e2e_local.py run <case_id> --work-dir DIR [--model glm-5.3-prime]
@@ -138,6 +145,10 @@ def cmd_run(args: argparse.Namespace) -> int:
 
     agent_log = work / "agent.log"
     budget = args.timeout
+    if not args.sandbox:
+        print("[e2e] WARNING: running the agent with no --sandbox: its own "
+              "process has NO filesystem/env containment. Pass --sandbox "
+              "infra/sandbox_wrapper.sh for any real/adversarial run.", file=sys.stderr)
     print(f"[e2e] running agent={args.agent} model={args.model} (budget {budget}s)", flush=True)
     t0 = time.time()
     # The agent CLI invocation is intentionally thin; the heavy driving (tool
@@ -145,6 +156,8 @@ def cmd_run(args: argparse.Namespace) -> int:
     # a cwd of the work dir, and read back out/poc + out/fix.patch.
     cli = [args.agent, "--model", args.model, "-p", E2E_PROMPT,
            "--dangerously-skip-permissions"]
+    if args.sandbox:
+        cli = [args.sandbox, *cli]
     env = e2e_firewall.proxy_env(proxy_url, os.environ) if proxy_url else None
     try:
         with agent_log.open("w") as lf:
@@ -223,6 +236,9 @@ def main() -> int:
     r.add_argument("--work-dir", required=True)
     r.add_argument("--server", default="http://127.0.0.1:8900")
     r.add_argument("--agent", default="claude")
+    r.add_argument("--sandbox", default=None,
+                  help="sandbox wrapper to prefix the agent subprocess with, e.g. "
+                       "infra/sandbox_wrapper.sh (recommended for any real run)")
     r.add_argument("--model", default="glm-5.3-prime")
     r.add_argument("--timeout", type=int, default=10800, help="agent wall budget (s)")
     r.add_argument("--score-timeout", type=int, default=2400, help="server scoring poll budget (s)")

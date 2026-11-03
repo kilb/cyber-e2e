@@ -231,3 +231,8 @@ def test_docker_hardening_flags():
     assert "--memory" in args and "4g" in args
     assert "--cpus" in args and "2" in args
     assert "--name" in args and "e2e-test-container" in args
+    # --cpus alone is CFS quota/period throttling: nproc()/sched_getaffinity()
+    # inside the container still see the HOST's full core count, so a case's
+    # own `make -j$(nproc)` oversubscribes anyway. --cpuset-cpus pins an
+    # actual CPU set so nproc() self-reports the real entitlement.
+    assert "--cpuset-cpus" in args and "0-1" in args
